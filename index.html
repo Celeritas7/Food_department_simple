@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cooking App - Meal Planner & Grocery Manager</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/dexie@3.2.4/dist/dexie.min.js"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            'cream': '#FDF8F3',
+            'warm-white': '#FAF7F2',
+            'terracotta': '#C4704F',
+            'terracotta-dark': '#A85A3B',
+            'sage': '#87A878',
+            'sage-dark': '#6B8F5B',
+            'charcoal': '#2D3436',
+            'warm-gray': '#636E72',
+            'light-gray': '#B2BEC3',
+            'butter': '#F6E58D',
+            'tomato': '#E55039',
+          },
+        },
+      },
+    }
+  </script>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; background-color: #FDF8F3; margin: 0; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .animate-fadeIn { animation: fadeIn 0.3s ease-out forwards; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useMemo } = React;
+
+    // ============== DATABASE ==============
+    const db = new Dexie('CookingAppDB');
+    db.version(2).stores({
+      ingredients: 'id, name, purchasedAt',
+      dishes: 'id, name, status, priority'
+    });
+
+    // ============== UTILITIES ==============
+    const generateId = () => 'id_' + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+
+    // ============== SPOILAGE ENGINE ==============
+    const computeSpoilage = (ingredient, currentDate = new Date()) => {
+      if (!ingredient.purchasedAt || !ingredient.shelfLifeDays || ingredient.shelfLifeDays <= 0) {
+        return { expiryDate: null, daysRemaining: null, spoilageStatus: 'Unknown' };
+      }
+      const purchaseDate = new Date(ingredient.purchasedAt);
+      if (isNaN(purchaseDate.getTime())) {
+        return { expiryDate: null, daysRemaining: null, spoilageStatus: 'Unknown' };
+      }
+      const expiryDate = new Date(purchaseDate);
+      expiryDate.setDate(expiryDate.getDate() + ingredient.shelfLifeDays);
+      const msPerDay = 24 * 60 * 60 * 1000;
+      const daysRemaining = Math.ceil((expiryDate.getTime() - currentDate.getTime()) / msPerDay);
+      let spoilageStatus;
+      if (daysRemaining < 0) spoilageStatus = 'Expired';
+      else if (daysRemaining <= 3) spoilageStatus = 'NearExpiry';
+      else spoilageStatus = 'Fresh';
+      return { expiryDate, daysRemaining, spoilageStatus };
+    };
+
+    const enrichWithSpoilage = (ingredient) => {
+      const spoilage = computeSpoilage(ingredient);
+      return { ...ingredient, inStock: ingredient.stockQty > 0, ...spoilage };
+    };
+
+    // ============== AVAILABILITY ENGINE ==============
+    const computeAvailability = (dish, ingredients) => {
+      const ingredientMap = new Map(ingredients.map(i => [i.id, i]));
+      const isUnlinked = dish.recipeIngredients.length === 0;
+      if (isUnlinked) return { canCook: false, isUnlinked: true, missingIngredients: [] };
+      
+      const missingIngredients = [];
+      for (const entry of dish.recipeIngredients) {
+        const ingredient = ingredientMap.get(entry.ingredientId);
+        if (!ingredient) {
+          missingIngredients.push({ ingredientId: entry.ingredientId, ingredientName: '[Deleted]', requiredQty: entry.qty, availableQty: 0, unit: '?' });
+        } else if (ingredient.stockQty < entry.qty) {
+          missingIngredients.push({ ingredientId: entry.ingredientId, ingredientName: ingredient.name, requiredQty: entry.qty, availableQty: ingredient.stockQty, unit: ingredient.unit });
+        }
+      }
+      return { canCook: missingIngredients.length === 0, isUnlinked: false, missingIngredients };
+    };
+
+    const enrichWithAvailability = (dish, ingredients) => {
+      const availability = computeAvailability(dish, ingredients);
+      return { ...dish, isActive: dish.status !== 'Cooked', ...availability };
+    };
+
+    // ============== ICONS ==============
+    const Icons = {
+      Package: () => <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16.5 9.4 7.55 4.24"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.29 7 12 12 20.71 7"/><line x1="12" x2="12" y1="22" y2="12"/></svg>,
+      UtensilsCrossed: () => <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m16 2-2.3 2.3a3 3 0 0 0 0 4.2l1.8 1.8a3 3 0 0 0 4.2 0L22 8"/><path d="M15 15 3.3 3.3a4.2 4.2 0 0 0 0 6l7.3 7.3c.7.7 2 .7 2.8 0L15 15Zm0 0 7 7"/><path d="m2.1 21.8 6.4-6.3"/><path d="m19 5-7 7"/></svg>,
+      Plus: () => <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>,
+      ShoppingCart: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg>,
+      Edit: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>,
+      Trash: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>,
+      X: () => <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>,
+      ChefHat: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21a1 1 0 0 0 1-1v-5.35c0-.457.316-.844.727-1.041a4 4 0 0 0-2.134-7.589 5 5 0 0 0-9.186 0 4 4 0 0 0-2.134 7.588c.411.198.727.585.727 1.041V20a1 1 0 0 0 1 1Z"/><path d="M6 17h12"/></svg>,
+      Check: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>,
+      Clock: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
+      Alert: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>,
+      Help: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>,
+    };
+
+    // ============== COMMON COMPONENTS ==============
+    const Modal = ({ isOpen, onClose, title, children }) => {
+      if (!isOpen) return null;
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-charcoal/50 backdrop-blur-sm" onClick={onClose} />
+          <div className="relative w-full max-w-md bg-white rounded-2xl shadow-lg animate-fadeIn">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-light-gray/30">
+              <h2 className="font-semibold text-xl text-charcoal">{title}</h2>
+              <button onClick={onClose} className="p-2 -mr-2 rounded-lg text-warm-gray hover:text-charcoal hover:bg-light-gray/30">
+                <Icons.X />
+              </button>
+            </div>
+            <div className="px-6 py-4">{children}</div>
+          </div>
+        </div>
+      );
+    };
+
+    const SpoilageBadge = ({ status, daysRemaining }) => {
+      const config = {
+        Fresh: { bg: 'bg-sage/20', text: 'text-sage-dark', label: 'Fresh', icon: Icons.Check },
+        NearExpiry: { bg: 'bg-butter/40', text: 'text-yellow-700', label: 'Expires soon', icon: Icons.Clock },
+        Expired: { bg: 'bg-tomato/20', text: 'text-tomato', label: 'Expired', icon: Icons.Alert },
+        Unknown: { bg: 'bg-light-gray/30', text: 'text-warm-gray', label: 'No data', icon: Icons.Help },
+      }[status] || { bg: 'bg-light-gray/30', text: 'text-warm-gray', label: 'Unknown', icon: Icons.Help };
+      
+      const Icon = config.icon;
+      const daysText = daysRemaining !== null ? (daysRemaining < 0 ? `${Math.abs(daysRemaining)}d ago` : daysRemaining === 0 ? 'Today' : `${daysRemaining}d left`) : null;
+      
+      return (
+        <span className={`inline-flex items-center gap-1.5 rounded-full text-xs px-2 py-0.5 font-medium ${config.bg} ${config.text}`}>
+          <Icon /><span>{config.label}</span>{daysText && <span className="opacity-75">· {daysText}</span>}
+        </span>
+      );
+    };
+
+    const AvailabilityBadge = ({ canCook, isUnlinked }) => {
+      if (isUnlinked) return <span className="inline-flex items-center gap-1.5 rounded-full text-xs px-2 py-0.5 font-medium bg-amber-100 text-amber-700"><Icons.Alert /><span>⚠️ Unlinked</span></span>;
+      if (canCook) return <span className="inline-flex items-center gap-1.5 rounded-full text-xs px-2 py-0.5 font-medium bg-sage/20 text-sage-dark"><Icons.Check /><span>Ready</span></span>;
+      return <span className="inline-flex items-center gap-1.5 rounded-full text-xs px-2 py-0.5 font-medium bg-tomato/10 text-tomato"><Icons.Alert /><span>Missing items</span></span>;
+    };
+
+    // ============== INGREDIENT COMPONENTS ==============
+    const IngredientCard = ({ ingredient, onBuy, onEdit, onDelete }) => (
+      <div className="bg-white rounded-xl border border-light-gray/30 shadow-sm hover:shadow-md transition-all overflow-hidden animate-fadeIn">
+        <div className="p-4 pb-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex-1 min-w-0">
+              <h3 className="font-semibold text-lg text-charcoal truncate">{ingredient.name}</h3>
+              <div className="mt-1 flex items-center gap-2">
+                <span className={`text-sm font-medium ${ingredient.inStock ? 'text-charcoal' : 'text-tomato'}`}>
+                  {ingredient.stockQty} {ingredient.unit}
+                </span>
+              </div>
+            </div>
+            <SpoilageBadge status={ingredient.spoilageStatus} daysRemaining={ingredient.daysRemaining} />
+          </div>
+        </div>
+        <div className="px-4 pb-3"><p className="text-xs text-warm-gray">Shelf life: {ingredient.shelfLifeDays} days</p></div>
+        <div className="border-t border-light-gray/30 bg-warm-white/50 px-2 py-2 flex gap-1">
+          <button onClick={() => onBuy(ingredient)} className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium text-terracotta hover:bg-terracotta/10"><Icons.ShoppingCart /><span>Buy</span></button>
+          <button onClick={() => onEdit(ingredient)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-light-gray/30 hover:text-charcoal"><Icons.Edit /></button>
+          <button onClick={() => onDelete(ingredient)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-tomato/10 hover:text-tomato"><Icons.Trash /></button>
+        </div>
+      </div>
+    );
+
+    const IngredientForm = ({ initialData, onSubmit, onCancel }) => {
+      const [name, setName] = useState(initialData?.name || '');
+      const [unit, setUnit] = useState(initialData?.unit || 'pieces');
+      const [stockQty, setStockQty] = useState(initialData?.stockQty || 0);
+      const [shelfLifeDays, setShelfLifeDays] = useState(initialData?.shelfLifeDays || 7);
+      
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        if (!name.trim()) return alert('Name is required');
+        if (shelfLifeDays <= 0) return alert('Shelf life must be greater than 0');
+        onSubmit({ name: name.trim(), unit, stockQty, shelfLifeDays });
+      };
+      
+      const units = ['pieces', 'g', 'kg', 'ml', 'L', 'cups', 'tbsp', 'tsp'];
+      
+      return (
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-charcoal mb-1">Name *</label>
+            <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="e.g., Tomato" className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-charcoal mb-1">Unit *</label>
+            <select value={unit} onChange={e => setUnit(e.target.value)} className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta">
+              {units.map(u => <option key={u} value={u}>{u}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-charcoal mb-1">Current Stock</label>
+            <input type="number" value={stockQty} onChange={e => setStockQty(parseFloat(e.target.value) || 0)} min="0" step="0.1" className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-charcoal mb-1">Shelf Life (days) *</label>
+            <input type="number" value={shelfLifeDays} onChange={e => setShelfLifeDays(parseInt(e.target.value) || 1)} min="1" className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta" />
+          </div>
+          <div className="flex gap-3 pt-4 border-t border-light-gray/30">
+            <button type="button" onClick={onCancel} className="flex-1 px-4 py-2.5 rounded-lg border border-light-gray/50 text-warm-gray font-medium hover:bg-light-gray/20">Cancel</button>
+            <button type="submit" className="flex-1 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark">{initialData ? 'Update' : 'Add'}</button>
+          </div>
+        </form>
+      );
+    };
+
+    const BuyDialog = ({ ingredient, onConfirm, onCancel }) => {
+      const [qty, setQty] = useState(1);
+      return (
+        <div className="space-y-4">
+          <div className="bg-warm-white rounded-xl p-4">
+            <h3 className="font-semibold text-lg text-charcoal">{ingredient.name}</h3>
+            <p className="text-sm text-warm-gray">Current: {ingredient.stockQty} {ingredient.unit}</p>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-charcoal mb-1">Purchase Quantity</label>
+            <input type="number" value={qty} onChange={e => setQty(parseFloat(e.target.value) || 0)} min="0.1" step="0.1" className="w-full px-4 py-3 rounded-lg border border-light-gray/50 text-lg focus:outline-none focus:ring-2 focus:ring-terracotta/30" autoFocus />
+          </div>
+          <div className="bg-sage/10 rounded-xl p-4 flex justify-between">
+            <div><span className="text-sm text-warm-gray">Current</span><div className="font-medium text-charcoal">{ingredient.stockQty} {ingredient.unit}</div></div>
+            <div className="text-right"><span className="text-sm text-warm-gray">After</span><div className="font-medium text-sage-dark">{(ingredient.stockQty + qty).toFixed(1)} {ingredient.unit}</div></div>
+          </div>
+          <div className="flex gap-3">
+            <button onClick={onCancel} className="flex-1 px-4 py-2.5 rounded-lg border border-light-gray/50 text-warm-gray font-medium hover:bg-light-gray/20">Cancel</button>
+            <button onClick={() => qty > 0 && onConfirm(qty)} className="flex-1 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark">Record Purchase</button>
+          </div>
+        </div>
+      );
+    };
+
+    // ============== DISH COMPONENTS ==============
+    const DishCard = ({ dish, ingredients, onCook, onEdit, onDelete }) => {
+      const isCooked = dish.status === 'Cooked';
+      return (
+        <div className={`bg-white rounded-xl border shadow-sm hover:shadow-md transition-all overflow-hidden animate-fadeIn ${isCooked ? 'border-sage/30 opacity-75' : 'border-light-gray/30'}`}>
+          <div className="p-4 pb-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex-1 min-w-0">
+                <h3 className={`font-semibold text-lg truncate ${isCooked ? 'text-warm-gray' : 'text-charcoal'}`}>{dish.name}</h3>
+                <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${dish.status === 'Planned' ? 'bg-blue-100 text-blue-700' : dish.status === 'InProgress' ? 'bg-amber-100 text-amber-700' : 'bg-sage/20 text-sage-dark'}`}>{dish.status}</span>
+                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${dish.priority <= 2 ? 'bg-tomato/10 text-tomato' : 'bg-light-gray/30 text-warm-gray'}`}>P{dish.priority}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          {dish.isActive && (
+            <div className="px-4 pb-3">
+              <AvailabilityBadge canCook={dish.canCook} isUnlinked={dish.isUnlinked} />
+              {dish.missingIngredients.length > 0 && (
+                <div className="mt-2 text-xs text-warm-gray">
+                  <span className="text-tomato">Missing: </span>
+                  {dish.missingIngredients.map(m => m.ingredientName).join(', ')}
+                </div>
+              )}
+            </div>
+          )}
+          <div className="px-4 pb-3 text-xs text-warm-gray">{dish.recipeIngredients.length} ingredient(s)</div>
+          <div className="border-t border-light-gray/30 bg-warm-white/50 px-2 py-2 flex gap-1">
+            {dish.isActive && (
+              <button onClick={() => onCook(dish)} disabled={!dish.canCook} className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium ${dish.canCook ? 'text-sage-dark hover:bg-sage/20' : 'text-light-gray cursor-not-allowed'}`}><Icons.ChefHat /><span>Cook</span></button>
+            )}
+            <button onClick={() => onEdit(dish)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-light-gray/30 hover:text-charcoal"><Icons.Edit /></button>
+            <button onClick={() => onDelete(dish)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-tomato/10 hover:text-tomato"><Icons.Trash /></button>
+          </div>
+        </div>
+      );
+    };
+
+    const DishForm = ({ initialData, ingredients, onSubmit, onCancel }) => {
+      const [name, setName] = useState(initialData?.name || '');
+      const [priority, setPriority] = useState(initialData?.priority || 3);
+      const [recipeIngredients, setRecipeIngredients] = useState(initialData?.recipeIngredients || []);
+      
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        if (!name.trim()) return alert('Name is required');
+        onSubmit({ name: name.trim(), priority, recipeIngredients });
+      };
+      
+      const addIngredient = () => {
+        const unused = ingredients.filter(i => !recipeIngredients.some(r => r.ingredientId === i.id));
+        if (unused.length === 0) return;
+        setRecipeIngredients([...recipeIngredients, { ingredientId: unused[0].id, qty: 1 }]);
+      };
+      
+      const removeIngredient = (index) => {
+        setRecipeIngredients(recipeIngredients.filter((_, i) => i !== index));
+      };
+      
+      const updateIngredient = (index, field, value) => {
+        const updated = [...recipeIngredients];
+        updated[index] = { ...updated[index], [field]: value };
+        setRecipeIngredients(updated);
+      };
+      
+      return (
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-charcoal mb-1">Dish Name *</label>
+            <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="e.g., Pasta Marinara" className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-charcoal mb-1">Priority</label>
+            <select value={priority} onChange={e => setPriority(parseInt(e.target.value))} className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30">
+              <option value={1}>1 - Urgent</option>
+              <option value={2}>2 - High</option>
+              <option value={3}>3 - Normal</option>
+              <option value={4}>4 - Low</option>
+              <option value={5}>5 - Someday</option>
+            </select>
+          </div>
+          <div className="border-t border-light-gray/30 pt-4">
+            <div className="flex justify-between items-center mb-2">
+              <label className="text-sm font-medium text-charcoal">Recipe Ingredients</label>
+              <button type="button" onClick={addIngredient} className="text-sm text-terracotta hover:text-terracotta-dark flex items-center gap-1"><Icons.Plus /> Add</button>
+            </div>
+            {recipeIngredients.length === 0 ? (
+              <p className="text-sm text-amber-600 italic py-2">⚠️ No ingredients - dish will be "Unlinked"</p>
+            ) : (
+              <div className="space-y-2">
+                {recipeIngredients.map((entry, idx) => {
+                  const ing = ingredients.find(i => i.id === entry.ingredientId);
+                  return (
+                    <div key={idx} className="flex gap-2 items-center">
+                      <select value={entry.ingredientId} onChange={e => updateIngredient(idx, 'ingredientId', e.target.value)} className="flex-1 px-3 py-2 rounded-lg border border-light-gray/50 text-sm">
+                        {ingredients.map(i => <option key={i.id} value={i.id}>{i.name}</option>)}
+                      </select>
+                      <input type="number" value={entry.qty} onChange={e => updateIngredient(idx, 'qty', parseFloat(e.target.value) || 0)} min="0.1" step="0.1" className="w-20 px-3 py-2 rounded-lg border border-light-gray/50 text-sm text-center" />
+                      <span className="text-xs text-warm-gray w-10">{ing?.unit}</span>
+                      <button type="button" onClick={() => removeIngredient(idx)} className="p-2 text-warm-gray hover:text-tomato"><Icons.Trash /></button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          <div className="flex gap-3 pt-4 border-t border-light-gray/30">
+            <button type="button" onClick={onCancel} className="flex-1 px-4 py-2.5 rounded-lg border border-light-gray/50 text-warm-gray font-medium hover:bg-light-gray/20">Cancel</button>
+            <button type="submit" className="flex-1 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark">{initialData ? 'Update' : 'Add'}</button>
+          </div>
+        </form>
+      );
+    };
+
+    // ============== PAGES ==============
+    const IngredientsPage = ({ ingredients, onAdd, onEdit, onDelete, onBuy }) => {
+      const [modal, setModal] = useState({ type: null, data: null });
+      
+      return (
+        <div className="min-h-screen bg-cream pb-20">
+          <header className="bg-white border-b border-light-gray/30 sticky top-0 z-10">
+            <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-terracotta/10 flex items-center justify-center text-terracotta"><Icons.Package /></div>
+                <div><h1 className="font-semibold text-xl text-charcoal">Ingredients</h1><p className="text-sm text-warm-gray">Manage inventory</p></div>
+              </div>
+              <button onClick={() => setModal({ type: 'add' })} className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark"><Icons.Plus /><span className="hidden sm:inline">Add</span></button>
+            </div>
+          </header>
+          <main className="max-w-4xl mx-auto px-4 py-6">
+            {ingredients.length === 0 ? (
+              <div className="text-center py-16">
+                <div className="w-16 h-16 rounded-full bg-light-gray/30 flex items-center justify-center mx-auto mb-4 text-light-gray"><Icons.Package /></div>
+                <h3 className="font-semibold text-lg text-charcoal mb-2">No ingredients yet</h3>
+                <p className="text-warm-gray mb-6">Start by adding ingredients you use.</p>
+                <button onClick={() => setModal({ type: 'add' })} className="px-5 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark">Add First Ingredient</button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {ingredients.map(ing => <IngredientCard key={ing.id} ingredient={ing} onBuy={() => setModal({ type: 'buy', data: ing })} onEdit={() => setModal({ type: 'edit', data: ing })} onDelete={() => { if (confirm(`Delete "${ing.name}"?`)) onDelete(ing.id); }} />)}
+              </div>
+            )}
+          </main>
+          <Modal isOpen={modal.type === 'add'} onClose={() => setModal({ type: null })} title="Add Ingredient">
+            <IngredientForm onSubmit={(data) => { onAdd(data); setModal({ type: null }); }} onCancel={() => setModal({ type: null })} />
+          </Modal>
+          <Modal isOpen={modal.type === 'edit'} onClose={() => setModal({ type: null })} title="Edit Ingredient">
+            {modal.data && <IngredientForm initialData={modal.data} onSubmit={(data) => { onEdit(modal.data.id, data); setModal({ type: null }); }} onCancel={() => setModal({ type: null })} />}
+          </Modal>
+          <Modal isOpen={modal.type === 'buy'} onClose={() => setModal({ type: null })} title="Record Purchase">
+            {modal.data && <BuyDialog ingredient={modal.data} onConfirm={(qty) => { onBuy(modal.data.id, qty); setModal({ type: null }); }} onCancel={() => setModal({ type: null })} />}
+          </Modal>
+        </div>
+      );
+    };
+
+    const DishesPage = ({ dishes, ingredients, onAdd, onEdit, onDelete, onCook }) => {
+      const [modal, setModal] = useState({ type: null, data: null });
+      const [filter, setFilter] = useState('active');
+      
+      const filteredDishes = useMemo(() => {
+        let result = dishes;
+        if (filter === 'active') result = dishes.filter(d => d.isActive);
+        else if (filter === 'ready') result = dishes.filter(d => d.isActive && d.canCook);
+        else if (filter === 'cooked') result = dishes.filter(d => !d.isActive);
+        return result.sort((a, b) => (a.isActive === b.isActive ? a.priority - b.priority : a.isActive ? -1 : 1));
+      }, [dishes, filter]);
+      
+      return (
+        <div className="min-h-screen bg-cream pb-20">
+          <header className="bg-white border-b border-light-gray/30 sticky top-0 z-10">
+            <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-terracotta/10 flex items-center justify-center text-terracotta"><Icons.UtensilsCrossed /></div>
+                <div><h1 className="font-semibold text-xl text-charcoal">Dishes</h1><p className="text-sm text-warm-gray">Plan & cook meals</p></div>
+              </div>
+              <button onClick={() => setModal({ type: 'add' })} className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark"><Icons.Plus /><span className="hidden sm:inline">Add</span></button>
+            </div>
+          </header>
+          <main className="max-w-4xl mx-auto px-4 py-6">
+            {dishes.length > 0 && (
+              <div className="flex gap-2 mb-6 overflow-x-auto pb-2">
+                {['active', 'ready', 'all', 'cooked'].map(f => (
+                  <button key={f} onClick={() => setFilter(f)} className={`px-3 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap ${filter === f ? 'bg-terracotta text-white' : 'bg-white text-warm-gray hover:bg-light-gray/30'}`}>
+                    {f === 'active' ? 'Active' : f === 'ready' ? 'Ready' : f === 'all' ? 'All' : 'Cooked'}
+                  </button>
+                ))}
+              </div>
+            )}
+            {filteredDishes.length === 0 ? (
+              <div className="text-center py-16">
+                <div className="w-16 h-16 rounded-full bg-light-gray/30 flex items-center justify-center mx-auto mb-4 text-light-gray"><Icons.UtensilsCrossed /></div>
+                <h3 className="font-semibold text-lg text-charcoal mb-2">{dishes.length === 0 ? 'No dishes yet' : 'No dishes match filter'}</h3>
+                {dishes.length === 0 && <button onClick={() => setModal({ type: 'add' })} className="px-5 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark mt-4">Add First Dish</button>}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {filteredDishes.map(dish => <DishCard key={dish.id} dish={dish} ingredients={ingredients} onCook={() => setModal({ type: 'cook', data: dish })} onEdit={() => setModal({ type: 'edit', data: dish })} onDelete={() => { if (confirm(`Delete "${dish.name}"?`)) onDelete(dish.id); }} />)}
+              </div>
+            )}
+          </main>
+          <Modal isOpen={modal.type === 'add'} onClose={() => setModal({ type: null })} title="Add Dish">
+            <DishForm ingredients={ingredients} onSubmit={(data) => { onAdd(data); setModal({ type: null }); }} onCancel={() => setModal({ type: null })} />
+          </Modal>
+          <Modal isOpen={modal.type === 'edit'} onClose={() => setModal({ type: null })} title="Edit Dish">
+            {modal.data && <DishForm initialData={modal.data} ingredients={ingredients} onSubmit={(data) => { onEdit(modal.data.id, data); setModal({ type: null }); }} onCancel={() => setModal({ type: null })} />}
+          </Modal>
+          <Modal isOpen={modal.type === 'cook'} onClose={() => setModal({ type: null })} title="Cook Dish">
+            {modal.data && (
+              <div className="space-y-4">
+                <div className="bg-sage/10 rounded-xl p-4">
+                  <h3 className="font-semibold text-lg text-charcoal mb-2">{modal.data.name}</h3>
+                  <p className="text-sm text-warm-gray mb-2">This will deduct:</p>
+                  <ul className="text-sm space-y-1">
+                    {modal.data.recipeIngredients.map(entry => {
+                      const ing = ingredients.find(i => i.id === entry.ingredientId);
+                      return <li key={entry.ingredientId} className="flex justify-between"><span>{ing?.name}</span><span className="text-warm-gray">-{entry.qty} {ing?.unit}</span></li>;
+                    })}
+                  </ul>
+                </div>
+                <div className="flex gap-3">
+                  <button onClick={() => setModal({ type: null })} className="flex-1 px-4 py-2.5 rounded-lg border border-light-gray/50 text-warm-gray font-medium hover:bg-light-gray/20">Cancel</button>
+                  <button onClick={() => { onCook(modal.data.id); setModal({ type: null }); }} className="flex-1 px-4 py-2.5 rounded-lg bg-sage text-white font-medium hover:bg-sage-dark">Cook Now</button>
+                </div>
+              </div>
+            )}
+          </Modal>
+        </div>
+      );
+    };
+
+    // ============== MAIN APP ==============
+    const App = () => {
+      const [page, setPage] = useState('ingredients');
+      const [ingredients, setIngredients] = useState([]);
+      const [dishes, setDishes] = useState([]);
+      const [loading, setLoading] = useState(true);
+
+      // Load data from IndexedDB
+      useEffect(() => {
+        const loadData = async () => {
+          const ings = await db.ingredients.toArray();
+          const dsh = await db.dishes.toArray();
+          setIngredients(ings);
+          setDishes(dsh);
+          setLoading(false);
+        };
+        loadData();
+      }, []);
+
+      // Enrich data
+      const enrichedIngredients = useMemo(() => ingredients.map(enrichWithSpoilage), [ingredients]);
+      const enrichedDishes = useMemo(() => dishes.map(d => enrichWithAvailability(d, ingredients)), [dishes, ingredients]);
+
+      // Ingredient actions
+      const addIngredient = async (data) => {
+        const ingredient = { id: generateId(), ...data, purchasedAt: null };
+        await db.ingredients.add(ingredient);
+        setIngredients([...ingredients, ingredient]);
+      };
+
+      const editIngredient = async (id, data) => {
+        await db.ingredients.update(id, data);
+        setIngredients(ingredients.map(i => i.id === id ? { ...i, ...data } : i));
+      };
+
+      const deleteIngredient = async (id) => {
+        await db.ingredients.delete(id);
+        setIngredients(ingredients.filter(i => i.id !== id));
+      };
+
+      const buyIngredient = async (id, qty) => {
+        const updates = { stockQty: (ingredients.find(i => i.id === id)?.stockQty || 0) + qty, purchasedAt: new Date().toISOString() };
+        await db.ingredients.update(id, updates);
+        setIngredients(ingredients.map(i => i.id === id ? { ...i, ...updates } : i));
+      };
+
+      // Dish actions
+      const addDish = async (data) => {
+        const dish = { id: generateId(), ...data, status: 'Planned', recipeIntermediates: [] };
+        await db.dishes.add(dish);
+        setDishes([...dishes, dish]);
+      };
+
+      const editDish = async (id, data) => {
+        await db.dishes.update(id, data);
+        setDishes(dishes.map(d => d.id === id ? { ...d, ...data } : d));
+      };
+
+      const deleteDish = async (id) => {
+        await db.dishes.delete(id);
+        setDishes(dishes.filter(d => d.id !== id));
+      };
+
+      const cookDish = async (id) => {
+        const dish = dishes.find(d => d.id === id);
+        if (!dish) return;
+        
+        // Deduct ingredients
+        const updatedIngredients = [...ingredients];
+        for (const entry of dish.recipeIngredients) {
+          const idx = updatedIngredients.findIndex(i => i.id === entry.ingredientId);
+          if (idx !== -1) {
+            updatedIngredients[idx] = { ...updatedIngredients[idx], stockQty: Math.max(0, updatedIngredients[idx].stockQty - entry.qty) };
+            await db.ingredients.update(entry.ingredientId, { stockQty: updatedIngredients[idx].stockQty });
+          }
+        }
+        setIngredients(updatedIngredients);
+        
+        // Update dish status
+        await db.dishes.update(id, { status: 'Cooked' });
+        setDishes(dishes.map(d => d.id === id ? { ...d, status: 'Cooked' } : d));
+      };
+
+      if (loading) {
+        return <div className="min-h-screen bg-cream flex items-center justify-center"><div className="w-8 h-8 border-2 border-terracotta border-t-transparent rounded-full animate-spin"></div></div>;
+      }
+
+      return (
+        <div>
+          {page === 'ingredients' && <IngredientsPage ingredients={enrichedIngredients} onAdd={addIngredient} onEdit={editIngredient} onDelete={deleteIngredient} onBuy={buyIngredient} />}
+          {page === 'dishes' && <DishesPage dishes={enrichedDishes} ingredients={enrichedIngredients} onAdd={addDish} onEdit={editDish} onDelete={deleteDish} onCook={cookDish} />}
+          
+          {/* Bottom Navigation */}
+          <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-light-gray/30 z-20">
+            <div className="max-w-4xl mx-auto flex justify-around">
+              <button onClick={() => setPage('ingredients')} className={`flex flex-col items-center gap-1 py-3 px-6 ${page === 'ingredients' ? 'text-terracotta' : 'text-warm-gray'}`}>
+                <Icons.Package /><span className="text-xs font-medium">Ingredients</span>
+              </button>
+              <button onClick={() => setPage('dishes')} className={`flex flex-col items-center gap-1 py-3 px-6 ${page === 'dishes' ? 'text-terracotta' : 'text-warm-gray'}`}>
+                <Icons.UtensilsCrossed /><span className="text-xs font-medium">Dishes</span>
+              </button>
+            </div>
+          </nav>
+        </div>
+      );
+    };
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
