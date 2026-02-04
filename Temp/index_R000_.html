@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Cooking App - Phase 3: Shopping List</title>
+  <title>Cooking App - Meal Planner & Grocery Manager</title>
   <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -100,100 +100,20 @@
       return { ...dish, isActive: dish.status !== 'Cooked', ...availability };
     };
 
-    // ============== QUANTITY AGGREGATION ENGINE ==============
-    const computeQuantityAggregation = (dishes, ingredients) => {
-      // Filter active dishes only
-      const activeDishes = dishes.filter(d => d.status !== 'Cooked');
-      
-      // Aggregate ingredient requirements
-      const ingredientRequirements = new Map();
-      
-      for (const dish of activeDishes) {
-        for (const entry of dish.recipeIngredients) {
-          const current = ingredientRequirements.get(entry.ingredientId) || { 
-            totalRequired: 0, 
-            dishes: [],
-            highestPriority: Infinity 
-          };
-          current.totalRequired += entry.qty;
-          current.dishes.push({ dishId: dish.id, dishName: dish.name, qty: entry.qty, priority: dish.priority });
-          current.highestPriority = Math.min(current.highestPriority, dish.priority);
-          ingredientRequirements.set(entry.ingredientId, current);
-        }
-      }
-      
-      // Build shopping list with deficits
-      const shoppingList = [];
-      const ingredientMap = new Map(ingredients.map(i => [i.id, i]));
-      
-      for (const [ingredientId, requirement] of ingredientRequirements) {
-        const ingredient = ingredientMap.get(ingredientId);
-        if (!ingredient) continue;
-        
-        const deficit = Math.max(0, requirement.totalRequired - ingredient.stockQty);
-        
-        shoppingList.push({
-          ingredientId,
-          ingredientName: ingredient.name,
-          unit: ingredient.unit,
-          currentStock: ingredient.stockQty,
-          totalRequired: requirement.totalRequired,
-          deficit,
-          needsToBuy: deficit > 0,
-          derivedPriority: requirement.highestPriority,
-          usedByDishes: requirement.dishes,
-        });
-      }
-      
-      // Sort by: needs to buy first, then by priority (lower = more urgent)
-      shoppingList.sort((a, b) => {
-        if (a.needsToBuy !== b.needsToBuy) return a.needsToBuy ? -1 : 1;
-        return a.derivedPriority - b.derivedPriority;
-      });
-      
-      return {
-        shoppingList,
-        totalItems: shoppingList.length,
-        itemsToBuy: shoppingList.filter(i => i.needsToBuy).length,
-        itemsInStock: shoppingList.filter(i => !i.needsToBuy).length,
-      };
-    };
-
-    // ============== PRIORITY PROPAGATION ENGINE ==============
-    const computePriorityPropagation = (dishes, ingredients) => {
-      const activeDishes = dishes.filter(d => d.status !== 'Cooked');
-      const ingredientPriorities = new Map();
-      
-      for (const dish of activeDishes) {
-        for (const entry of dish.recipeIngredients) {
-          const currentPriority = ingredientPriorities.get(entry.ingredientId) || Infinity;
-          ingredientPriorities.set(entry.ingredientId, Math.min(currentPriority, dish.priority));
-        }
-      }
-      
-      return ingredientPriorities;
-    };
-
     // ============== ICONS ==============
     const Icons = {
       Package: () => <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16.5 9.4 7.55 4.24"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.29 7 12 12 20.71 7"/><line x1="12" x2="12" y1="22" y2="12"/></svg>,
       UtensilsCrossed: () => <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m16 2-2.3 2.3a3 3 0 0 0 0 4.2l1.8 1.8a3 3 0 0 0 4.2 0L22 8"/><path d="M15 15 3.3 3.3a4.2 4.2 0 0 0 0 6l7.3 7.3c.7.7 2 .7 2.8 0L15 15Zm0 0 7 7"/><path d="m2.1 21.8 6.4-6.3"/><path d="m19 5-7 7"/></svg>,
-      ShoppingCart: () => <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg>,
-      ShoppingCartSmall: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg>,
       Plus: () => <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>,
+      ShoppingCart: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg>,
       Edit: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>,
       Trash: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>,
       X: () => <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>,
       ChefHat: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21a1 1 0 0 0 1-1v-5.35c0-.457.316-.844.727-1.041a4 4 0 0 0-2.134-7.589 5 5 0 0 0-9.186 0 4 4 0 0 0-2.134 7.588c.411.198.727.585.727 1.041V20a1 1 0 0 0 1 1Z"/><path d="M6 17h12"/></svg>,
       Check: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>,
-      CheckCircle: () => <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>,
       Clock: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
       Alert: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>,
       Help: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>,
-      Flag: () => <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" x2="4" y1="22" y2="15"/></svg>,
-      ArrowRight: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>,
-      CheckSquare: () => <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg>,
-      Square: () => <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/></svg>,
     };
 
     // ============== COMMON COMPONENTS ==============
@@ -202,8 +122,8 @@
       return (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-charcoal/50 backdrop-blur-sm" onClick={onClose} />
-          <div className="relative w-full max-w-md bg-white rounded-2xl shadow-lg animate-fadeIn max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-light-gray/30 sticky top-0 bg-white">
+          <div className="relative w-full max-w-md bg-white rounded-2xl shadow-lg animate-fadeIn">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-light-gray/30">
               <h2 className="font-semibold text-xl text-charcoal">{title}</h2>
               <button onClick={onClose} className="p-2 -mr-2 rounded-lg text-warm-gray hover:text-charcoal hover:bg-light-gray/30">
                 <Icons.X />
@@ -239,22 +159,6 @@
       return <span className="inline-flex items-center gap-1.5 rounded-full text-xs px-2 py-0.5 font-medium bg-tomato/10 text-tomato"><Icons.Alert /><span>Missing items</span></span>;
     };
 
-    const PriorityBadge = ({ priority }) => {
-      const config = {
-        1: { bg: 'bg-tomato/10', text: 'text-tomato', label: 'Urgent' },
-        2: { bg: 'bg-amber-100', text: 'text-amber-700', label: 'High' },
-        3: { bg: 'bg-light-gray/30', text: 'text-charcoal', label: 'Normal' },
-        4: { bg: 'bg-light-gray/20', text: 'text-warm-gray', label: 'Low' },
-        5: { bg: 'bg-light-gray/20', text: 'text-light-gray', label: 'Someday' },
-      }[priority] || { bg: 'bg-light-gray/30', text: 'text-charcoal', label: `P${priority}` };
-      
-      return (
-        <span className={`inline-flex items-center gap-1 rounded-full text-xs px-2 py-0.5 font-medium ${config.bg} ${config.text}`}>
-          <Icons.Flag /><span>{config.label}</span>
-        </span>
-      );
-    };
-
     // ============== INGREDIENT COMPONENTS ==============
     const IngredientCard = ({ ingredient, onBuy, onEdit, onDelete }) => (
       <div className="bg-white rounded-xl border border-light-gray/30 shadow-sm hover:shadow-md transition-all overflow-hidden animate-fadeIn">
@@ -273,7 +177,7 @@
         </div>
         <div className="px-4 pb-3"><p className="text-xs text-warm-gray">Shelf life: {ingredient.shelfLifeDays} days</p></div>
         <div className="border-t border-light-gray/30 bg-warm-white/50 px-2 py-2 flex gap-1">
-          <button onClick={() => onBuy(ingredient)} className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium text-terracotta hover:bg-terracotta/10"><Icons.ShoppingCartSmall /><span>Buy</span></button>
+          <button onClick={() => onBuy(ingredient)} className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium text-terracotta hover:bg-terracotta/10"><Icons.ShoppingCart /><span>Buy</span></button>
           <button onClick={() => onEdit(ingredient)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-light-gray/30 hover:text-charcoal"><Icons.Edit /></button>
           <button onClick={() => onDelete(ingredient)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-tomato/10 hover:text-tomato"><Icons.Trash /></button>
         </div>
@@ -358,7 +262,7 @@
                 <h3 className={`font-semibold text-lg truncate ${isCooked ? 'text-warm-gray' : 'text-charcoal'}`}>{dish.name}</h3>
                 <div className="mt-1.5 flex flex-wrap items-center gap-2">
                   <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${dish.status === 'Planned' ? 'bg-blue-100 text-blue-700' : dish.status === 'InProgress' ? 'bg-amber-100 text-amber-700' : 'bg-sage/20 text-sage-dark'}`}>{dish.status}</span>
-                  <PriorityBadge priority={dish.priority} />
+                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${dish.priority <= 2 ? 'bg-tomato/10 text-tomato' : 'bg-light-gray/30 text-warm-gray'}`}>P{dish.priority}</span>
                 </div>
               </div>
             </div>
@@ -459,87 +363,6 @@
             <button type="submit" className="flex-1 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark">{initialData ? 'Update' : 'Add'}</button>
           </div>
         </form>
-      );
-    };
-
-    // ============== SHOPPING LIST COMPONENTS ==============
-    const ShoppingListItem = ({ item, onBuy, onMarkComplete }) => {
-      const [isExpanded, setIsExpanded] = useState(false);
-      
-      return (
-        <div className={`bg-white rounded-xl border overflow-hidden animate-fadeIn ${item.needsToBuy ? 'border-tomato/30' : 'border-sage/30'}`}>
-          <div className="p-4">
-            <div className="flex items-center gap-3">
-              {/* Checkbox */}
-              <button 
-                onClick={() => onMarkComplete(item)}
-                className={`flex-shrink-0 ${item.needsToBuy ? 'text-light-gray hover:text-sage' : 'text-sage'}`}
-              >
-                {item.needsToBuy ? <Icons.Square /> : <Icons.CheckSquare />}
-              </button>
-              
-              {/* Content */}
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <h3 className={`font-semibold ${item.needsToBuy ? 'text-charcoal' : 'text-warm-gray line-through'}`}>
-                    {item.ingredientName}
-                  </h3>
-                  <PriorityBadge priority={item.derivedPriority} />
-                </div>
-                
-                <div className="mt-1 flex items-center gap-4 text-sm">
-                  <span className="text-warm-gray">
-                    Have: <span className="font-medium text-charcoal">{item.currentStock} {item.unit}</span>
-                  </span>
-                  <span className="text-warm-gray">
-                    Need: <span className="font-medium text-charcoal">{item.totalRequired} {item.unit}</span>
-                  </span>
-                  {item.needsToBuy && (
-                    <span className="text-tomato font-medium">
-                      Buy: {item.deficit} {item.unit}
-                    </span>
-                  )}
-                </div>
-              </div>
-              
-              {/* Actions */}
-              {item.needsToBuy && (
-                <button 
-                  onClick={() => onBuy(item)}
-                  className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-terracotta text-white text-sm font-medium hover:bg-terracotta-dark"
-                >
-                  <Icons.ShoppingCartSmall />
-                  Buy
-                </button>
-              )}
-              
-              {/* Expand toggle */}
-              <button 
-                onClick={() => setIsExpanded(!isExpanded)}
-                className="p-2 text-warm-gray hover:text-charcoal"
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`transform transition-transform ${isExpanded ? 'rotate-180' : ''}`}><path d="m6 9 6 6 6-6"/></svg>
-              </button>
-            </div>
-          </div>
-          
-          {/* Expanded: Show which dishes need this */}
-          {isExpanded && (
-            <div className="px-4 pb-4 pt-0">
-              <div className="bg-warm-white rounded-lg p-3">
-                <p className="text-xs text-warm-gray mb-2">Used in:</p>
-                <div className="space-y-1">
-                  {item.usedByDishes.map((dish, idx) => (
-                    <div key={idx} className="flex items-center justify-between text-sm">
-                      <span className="text-charcoal">{dish.dishName}</span>
-                      <span className="text-warm-gray">{dish.qty} {item.unit}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
       );
     };
 
@@ -660,130 +483,6 @@
       );
     };
 
-    const ShoppingListPage = ({ shoppingData, ingredients, onBuy }) => {
-      const [modal, setModal] = useState({ type: null, data: null });
-      const [showAll, setShowAll] = useState(false);
-      
-      const displayedItems = useMemo(() => {
-        if (showAll) return shoppingData.shoppingList;
-        return shoppingData.shoppingList.filter(item => item.needsToBuy);
-      }, [shoppingData.shoppingList, showAll]);
-      
-      const handleBuyFromList = (item) => {
-        const ingredient = ingredients.find(i => i.id === item.ingredientId);
-        if (ingredient) {
-          setModal({ type: 'buy', data: { ...ingredient, suggestedQty: item.deficit } });
-        }
-      };
-      
-      return (
-        <div className="min-h-screen bg-cream pb-20">
-          <header className="bg-white border-b border-light-gray/30 sticky top-0 z-10">
-            <div className="max-w-4xl mx-auto px-4 py-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-xl bg-terracotta/10 flex items-center justify-center text-terracotta"><Icons.ShoppingCart /></div>
-                  <div><h1 className="font-semibold text-xl text-charcoal">Shopping List</h1><p className="text-sm text-warm-gray">Auto-generated from dishes</p></div>
-                </div>
-              </div>
-              
-              {/* Summary */}
-              {shoppingData.totalItems > 0 && (
-                <div className="mt-4 flex flex-wrap gap-3">
-                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-tomato/10 text-tomato text-sm font-medium">
-                    <Icons.ShoppingCartSmall />
-                    <span>{shoppingData.itemsToBuy} to buy</span>
-                  </div>
-                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-sage/20 text-sage-dark text-sm font-medium">
-                    <Icons.CheckCircle />
-                    <span>{shoppingData.itemsInStock} in stock</span>
-                  </div>
-                </div>
-              )}
-            </div>
-          </header>
-          
-          <main className="max-w-4xl mx-auto px-4 py-6">
-            {shoppingData.totalItems === 0 ? (
-              <div className="text-center py-16">
-                <div className="w-16 h-16 rounded-full bg-light-gray/30 flex items-center justify-center mx-auto mb-4 text-light-gray"><Icons.ShoppingCart /></div>
-                <h3 className="font-semibold text-lg text-charcoal mb-2">No items needed</h3>
-                <p className="text-warm-gray">Add dishes to generate a shopping list.</p>
-              </div>
-            ) : (
-              <>
-                {/* Toggle */}
-                <div className="flex gap-2 mb-6">
-                  <button 
-                    onClick={() => setShowAll(false)} 
-                    className={`px-3 py-1.5 rounded-lg text-sm font-medium ${!showAll ? 'bg-terracotta text-white' : 'bg-white text-warm-gray hover:bg-light-gray/30'}`}
-                  >
-                    Need to Buy ({shoppingData.itemsToBuy})
-                  </button>
-                  <button 
-                    onClick={() => setShowAll(true)} 
-                    className={`px-3 py-1.5 rounded-lg text-sm font-medium ${showAll ? 'bg-terracotta text-white' : 'bg-white text-warm-gray hover:bg-light-gray/30'}`}
-                  >
-                    All Items ({shoppingData.totalItems})
-                  </button>
-                </div>
-                
-                {/* List */}
-                <div className="space-y-3">
-                  {displayedItems.map(item => (
-                    <ShoppingListItem 
-                      key={item.ingredientId} 
-                      item={item} 
-                      onBuy={() => handleBuyFromList(item)}
-                      onMarkComplete={() => {}}
-                    />
-                  ))}
-                </div>
-                
-                {displayedItems.length === 0 && (
-                  <div className="text-center py-8 text-warm-gray">
-                    {showAll ? 'No items in the list.' : '🎉 All items are in stock!'}
-                  </div>
-                )}
-              </>
-            )}
-          </main>
-          
-          <Modal isOpen={modal.type === 'buy'} onClose={() => setModal({ type: null })} title="Record Purchase">
-            {modal.data && <BuyDialogWithSuggestion ingredient={modal.data} onConfirm={(qty) => { onBuy(modal.data.id, qty); setModal({ type: null }); }} onCancel={() => setModal({ type: null })} />}
-          </Modal>
-        </div>
-      );
-    };
-
-    // Buy dialog with suggested quantity
-    const BuyDialogWithSuggestion = ({ ingredient, onConfirm, onCancel }) => {
-      const [qty, setQty] = useState(ingredient.suggestedQty || 1);
-      return (
-        <div className="space-y-4">
-          <div className="bg-warm-white rounded-xl p-4">
-            <h3 className="font-semibold text-lg text-charcoal">{ingredient.name}</h3>
-            <p className="text-sm text-warm-gray">Current: {ingredient.stockQty} {ingredient.unit}</p>
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-charcoal mb-1">Purchase Quantity</label>
-            <input type="number" value={qty} onChange={e => setQty(parseFloat(e.target.value) || 0)} min="0.1" step="0.1" className="w-full px-4 py-3 rounded-lg border border-light-gray/50 text-lg focus:outline-none focus:ring-2 focus:ring-terracotta/30" autoFocus />
-            {ingredient.suggestedQty && (
-              <p className="mt-1 text-xs text-sage-dark">Suggested: {ingredient.suggestedQty} {ingredient.unit} (to cover deficit)</p>
-            )}
-          </div>
-          <div className="bg-sage/10 rounded-xl p-4 flex justify-between">
-            <div><span className="text-sm text-warm-gray">Current</span><div className="font-medium text-charcoal">{ingredient.stockQty} {ingredient.unit}</div></div>
-            <div className="text-right"><span className="text-sm text-warm-gray">After</span><div className="font-medium text-sage-dark">{(ingredient.stockQty + qty).toFixed(1)} {ingredient.unit}</div></div>
-          </div>
-          <div className="flex gap-3">
-            <button onClick={onCancel} className="flex-1 px-4 py-2.5 rounded-lg border border-light-gray/50 text-warm-gray font-medium hover:bg-light-gray/20">Cancel</button>
-            <button onClick={() => qty > 0 && onConfirm(qty)} className="flex-1 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark">Record Purchase</button>
-          </div>
-        </div>
-      );
-    };
-
     // ============== MAIN APP ==============
     const App = () => {
       const [page, setPage] = useState('ingredients');
@@ -806,9 +505,6 @@
       // Enrich data
       const enrichedIngredients = useMemo(() => ingredients.map(enrichWithSpoilage), [ingredients]);
       const enrichedDishes = useMemo(() => dishes.map(d => enrichWithAvailability(d, ingredients)), [dishes, ingredients]);
-      
-      // Compute shopping list
-      const shoppingData = useMemo(() => computeQuantityAggregation(dishes, ingredients), [dishes, ingredients]);
 
       // Ingredient actions
       const addIngredient = async (data) => {
@@ -878,25 +574,15 @@
         <div>
           {page === 'ingredients' && <IngredientsPage ingredients={enrichedIngredients} onAdd={addIngredient} onEdit={editIngredient} onDelete={deleteIngredient} onBuy={buyIngredient} />}
           {page === 'dishes' && <DishesPage dishes={enrichedDishes} ingredients={enrichedIngredients} onAdd={addDish} onEdit={editDish} onDelete={deleteDish} onCook={cookDish} />}
-          {page === 'shopping' && <ShoppingListPage shoppingData={shoppingData} ingredients={enrichedIngredients} onBuy={buyIngredient} />}
           
           {/* Bottom Navigation */}
           <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-light-gray/30 z-20">
             <div className="max-w-4xl mx-auto flex justify-around">
-              <button onClick={() => setPage('ingredients')} className={`flex flex-col items-center gap-1 py-3 px-4 ${page === 'ingredients' ? 'text-terracotta' : 'text-warm-gray'}`}>
+              <button onClick={() => setPage('ingredients')} className={`flex flex-col items-center gap-1 py-3 px-6 ${page === 'ingredients' ? 'text-terracotta' : 'text-warm-gray'}`}>
                 <Icons.Package /><span className="text-xs font-medium">Ingredients</span>
               </button>
-              <button onClick={() => setPage('dishes')} className={`flex flex-col items-center gap-1 py-3 px-4 ${page === 'dishes' ? 'text-terracotta' : 'text-warm-gray'}`}>
+              <button onClick={() => setPage('dishes')} className={`flex flex-col items-center gap-1 py-3 px-6 ${page === 'dishes' ? 'text-terracotta' : 'text-warm-gray'}`}>
                 <Icons.UtensilsCrossed /><span className="text-xs font-medium">Dishes</span>
-              </button>
-              <button onClick={() => setPage('shopping')} className={`flex flex-col items-center gap-1 py-3 px-4 relative ${page === 'shopping' ? 'text-terracotta' : 'text-warm-gray'}`}>
-                <Icons.ShoppingCart />
-                <span className="text-xs font-medium">Shopping</span>
-                {shoppingData.itemsToBuy > 0 && (
-                  <span className="absolute top-2 right-2 w-5 h-5 bg-tomato text-white text-xs rounded-full flex items-center justify-center font-medium">
-                    {shoppingData.itemsToBuy}
-                  </span>
-                )}
               </button>
             </div>
           </nav>
