@@ -1,0 +1,1317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cooking App - Phase 4: Intermediates & Workflow Guards</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/dexie@3.2.4/dist/dexie.min.js"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            'cream': '#FDF8F3',
+            'warm-white': '#FAF7F2',
+            'terracotta': '#C4704F',
+            'terracotta-dark': '#A85A3B',
+            'sage': '#87A878',
+            'sage-dark': '#6B8F5B',
+            'charcoal': '#2D3436',
+            'warm-gray': '#636E72',
+            'light-gray': '#B2BEC3',
+            'butter': '#F6E58D',
+            'tomato': '#E55039',
+            'plum': '#8854d0',
+            'plum-dark': '#6c3db5',
+          },
+        },
+      },
+    }
+  </script>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; background-color: #FDF8F3; margin: 0; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .animate-fadeIn { animation: fadeIn 0.3s ease-out forwards; }
+    @keyframes shake { 0%,100% { transform: translateX(0); } 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
+    .animate-shake { animation: shake 0.3s ease-in-out; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+    // ============== DATABASE ==============
+    const db = new Dexie('CookingAppDB');
+    db.version(3).stores({
+      ingredients: 'id, name, purchasedAt',
+      intermediates: 'id, name',
+      dishes: 'id, name, status, priority'
+    });
+
+    // ============== UTILITIES ==============
+    const generateId = () => 'id_' + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+
+    // ============== TOAST SYSTEM ==============
+    const ToastContext = React.createContext();
+
+    const ToastProvider = ({ children }) => {
+      const [toasts, setToasts] = useState([]);
+      const addToast = useCallback((message, type = 'info') => {
+        const id = generateId();
+        setToasts(prev => [...prev, { id, message, type }]);
+        setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3500);
+      }, []);
+      return (
+        <ToastContext.Provider value={addToast}>
+          {children}
+          <div className="fixed top-4 right-4 z-[100] space-y-2 max-w-sm">
+            {toasts.map(t => (
+              <div key={t.id} className={`animate-fadeIn px-4 py-3 rounded-xl shadow-lg text-sm font-medium ${
+                t.type === 'error' ? 'bg-tomato text-white' :
+                t.type === 'success' ? 'bg-sage text-white' :
+                t.type === 'warning' ? 'bg-amber-500 text-white' :
+                'bg-charcoal text-white'
+              }`}>{t.message}</div>
+            ))}
+          </div>
+        </ToastContext.Provider>
+      );
+    };
+
+    const useToast = () => React.useContext(ToastContext);
+
+    // ============== SPOILAGE ENGINE ==============
+    const computeSpoilage = (ingredient, currentDate = new Date()) => {
+      if (!ingredient.purchasedAt || !ingredient.shelfLifeDays || ingredient.shelfLifeDays <= 0) {
+        return { expiryDate: null, daysRemaining: null, spoilageStatus: 'Unknown' };
+      }
+      const purchaseDate = new Date(ingredient.purchasedAt);
+      if (isNaN(purchaseDate.getTime())) {
+        return { expiryDate: null, daysRemaining: null, spoilageStatus: 'Unknown' };
+      }
+      const expiryDate = new Date(purchaseDate);
+      expiryDate.setDate(expiryDate.getDate() + ingredient.shelfLifeDays);
+      const msPerDay = 24 * 60 * 60 * 1000;
+      const daysRemaining = Math.ceil((expiryDate.getTime() - currentDate.getTime()) / msPerDay);
+      let spoilageStatus;
+      if (daysRemaining < 0) spoilageStatus = 'Expired';
+      else if (daysRemaining <= 3) spoilageStatus = 'NearExpiry';
+      else spoilageStatus = 'Fresh';
+      return { expiryDate, daysRemaining, spoilageStatus };
+    };
+
+    const enrichWithSpoilage = (ingredient) => {
+      const spoilage = computeSpoilage(ingredient);
+      return { ...ingredient, inStock: ingredient.stockQty > 0, ...spoilage };
+    };
+
+    // ============== AVAILABILITY ENGINE ==============
+    // Evaluates per-dish: can this single dish be cooked right now?
+    const computeAvailability = (dish, ingredients, intermediates) => {
+      const ingredientMap = new Map(ingredients.map(i => [i.id, i]));
+      const intermediateMap = new Map(intermediates.map(i => [i.id, i]));
+
+      const recipeIngs = dish.recipeIngredients || [];
+      const recipeInts = dish.recipeIntermediates || [];
+      const isUnlinked = recipeIngs.length === 0 && recipeInts.length === 0;
+      if (isUnlinked) return { canCook: false, isUnlinked: true, missingIngredients: [], missingIntermediates: [] };
+
+      const missingIngredients = [];
+      for (const entry of recipeIngs) {
+        const ingredient = ingredientMap.get(entry.ingredientId);
+        if (!ingredient) {
+          missingIngredients.push({ ingredientId: entry.ingredientId, ingredientName: '[Deleted]', requiredQty: entry.qty, availableQty: 0, unit: '?' });
+        } else if (ingredient.stockQty < entry.qty) {
+          missingIngredients.push({ ingredientId: entry.ingredientId, ingredientName: ingredient.name, requiredQty: entry.qty, availableQty: ingredient.stockQty, unit: ingredient.unit });
+        }
+      }
+
+      const missingIntermediates = [];
+      for (const entry of recipeInts) {
+        const intermediate = intermediateMap.get(entry.intermediateId);
+        if (!intermediate) {
+          missingIntermediates.push({ intermediateId: entry.intermediateId, intermediateName: '[Deleted]', requiredQty: entry.qty, availableQty: 0, unit: '?' });
+        } else if (intermediate.stockQty < entry.qty) {
+          missingIntermediates.push({ intermediateId: entry.intermediateId, intermediateName: intermediate.name, requiredQty: entry.qty, availableQty: intermediate.stockQty, unit: intermediate.unit });
+        }
+      }
+
+      return {
+        canCook: missingIngredients.length === 0 && missingIntermediates.length === 0,
+        isUnlinked: false,
+        missingIngredients,
+        missingIntermediates,
+      };
+    };
+
+    const enrichWithAvailability = (dish, ingredients, intermediates) => {
+      const availability = computeAvailability(dish, ingredients, intermediates);
+      return { ...dish, isActive: dish.status !== 'Cooked', ...availability };
+    };
+
+    // ============== QUANTITY AGGREGATION ENGINE ==============
+    const computeQuantityAggregation = (dishes, ingredients, intermediates) => {
+      const activeDishes = dishes.filter(d => d.status !== 'Cooked');
+      const ingredientMap = new Map(ingredients.map(i => [i.id, i]));
+      const intermediateMap = new Map(intermediates.map(i => [i.id, i]));
+
+      // --- Aggregate direct ingredient requirements ---
+      const ingredientRequirements = new Map();
+      const intermediateRequirements = new Map();
+
+      for (const dish of activeDishes) {
+        for (const entry of (dish.recipeIngredients || [])) {
+          const cur = ingredientRequirements.get(entry.ingredientId) || { totalRequired: 0, dishes: [], highestPriority: Infinity };
+          cur.totalRequired += entry.qty;
+          cur.dishes.push({ dishId: dish.id, dishName: dish.name, qty: entry.qty, priority: dish.priority });
+          cur.highestPriority = Math.min(cur.highestPriority, dish.priority);
+          ingredientRequirements.set(entry.ingredientId, cur);
+        }
+        for (const entry of (dish.recipeIntermediates || [])) {
+          const cur = intermediateRequirements.get(entry.intermediateId) || { totalRequired: 0, dishes: [], highestPriority: Infinity };
+          cur.totalRequired += entry.qty;
+          cur.dishes.push({ dishId: dish.id, dishName: dish.name, qty: entry.qty, priority: dish.priority });
+          cur.highestPriority = Math.min(cur.highestPriority, dish.priority);
+          intermediateRequirements.set(entry.intermediateId, cur);
+        }
+      }
+
+      // --- Build intermediate shopping list ---
+      const intermediateShoppingList = [];
+      for (const [intId, req] of intermediateRequirements) {
+        const inter = intermediateMap.get(intId);
+        if (!inter) continue;
+        const deficit = Math.max(0, req.totalRequired - inter.stockQty);
+        intermediateShoppingList.push({
+          intermediateId: intId,
+          intermediateName: inter.name,
+          unit: inter.unit,
+          currentStock: inter.stockQty,
+          totalRequired: req.totalRequired,
+          deficit,
+          needsToPrepare: deficit > 0,
+          derivedPriority: req.highestPriority,
+          usedByDishes: req.dishes,
+        });
+
+        // --- Expand intermediate deficit to ingredient requirements ---
+        if (deficit > 0 && inter.inputIngredients) {
+          for (const input of inter.inputIngredients) {
+            const extraIngQty = deficit * input.qtyPerUnit;
+            const cur = ingredientRequirements.get(input.ingredientId) || { totalRequired: 0, dishes: [], highestPriority: Infinity };
+            cur.totalRequired += extraIngQty;
+            cur.dishes.push({ dishId: `INT:${intId}`, dishName: `[for ${inter.name}]`, qty: extraIngQty, priority: req.highestPriority });
+            cur.highestPriority = Math.min(cur.highestPriority, req.highestPriority);
+            ingredientRequirements.set(input.ingredientId, cur);
+          }
+        }
+      }
+
+      // --- Build ingredient shopping list ---
+      const ingredientShoppingList = [];
+      for (const [ingId, req] of ingredientRequirements) {
+        const ing = ingredientMap.get(ingId);
+        if (!ing) continue;
+        const deficit = Math.max(0, req.totalRequired - ing.stockQty);
+        ingredientShoppingList.push({
+          ingredientId: ingId,
+          ingredientName: ing.name,
+          unit: ing.unit,
+          currentStock: ing.stockQty,
+          totalRequired: req.totalRequired,
+          deficit,
+          needsToBuy: deficit > 0,
+          derivedPriority: req.highestPriority,
+          usedByDishes: req.dishes,
+        });
+      }
+
+      ingredientShoppingList.sort((a, b) => {
+        if (a.needsToBuy !== b.needsToBuy) return a.needsToBuy ? -1 : 1;
+        return a.derivedPriority - b.derivedPriority;
+      });
+
+      intermediateShoppingList.sort((a, b) => {
+        if (a.needsToPrepare !== b.needsToPrepare) return a.needsToPrepare ? -1 : 1;
+        return a.derivedPriority - b.derivedPriority;
+      });
+
+      return {
+        ingredientShoppingList,
+        intermediateShoppingList,
+        totalIngredientItems: ingredientShoppingList.length,
+        ingredientsToBuy: ingredientShoppingList.filter(i => i.needsToBuy).length,
+        ingredientsInStock: ingredientShoppingList.filter(i => !i.needsToBuy).length,
+        totalIntermediateItems: intermediateShoppingList.length,
+        intermediatesToPrepare: intermediateShoppingList.filter(i => i.needsToPrepare).length,
+      };
+    };
+
+    // ============== PRIORITY PROPAGATION ENGINE ==============
+    const computePriorityPropagation = (dishes, intermediates) => {
+      const activeDishes = dishes.filter(d => d.status !== 'Cooked');
+      const ingredientPriorities = new Map();
+      const intermediatePriorities = new Map();
+
+      for (const dish of activeDishes) {
+        for (const entry of (dish.recipeIngredients || [])) {
+          const cur = ingredientPriorities.get(entry.ingredientId) || Infinity;
+          ingredientPriorities.set(entry.ingredientId, Math.min(cur, dish.priority));
+        }
+        for (const entry of (dish.recipeIntermediates || [])) {
+          const cur = intermediatePriorities.get(entry.intermediateId) || Infinity;
+          intermediatePriorities.set(entry.intermediateId, Math.min(cur, dish.priority));
+        }
+      }
+
+      // Propagate intermediate priority down to their input ingredients
+      const intermediateMap = new Map(intermediates.map(i => [i.id, i]));
+      for (const [intId, priority] of intermediatePriorities) {
+        const inter = intermediateMap.get(intId);
+        if (!inter || !inter.inputIngredients) continue;
+        for (const input of inter.inputIngredients) {
+          const cur = ingredientPriorities.get(input.ingredientId) || Infinity;
+          ingredientPriorities.set(input.ingredientId, Math.min(cur, priority));
+        }
+      }
+
+      return { ingredientPriorities, intermediatePriorities };
+    };
+
+    // ============== PREPARE AVAILABILITY CHECK ==============
+    const computePrepareAvailability = (intermediate, ingredients) => {
+      if (!intermediate.inputIngredients || intermediate.inputIngredients.length === 0) {
+        return { canPrepare: false, isUnlinked: true, missingInputs: [] };
+      }
+      const ingredientMap = new Map(ingredients.map(i => [i.id, i]));
+      const missingInputs = [];
+      for (const input of intermediate.inputIngredients) {
+        const ing = ingredientMap.get(input.ingredientId);
+        const needed = input.qtyPerUnit; // for 1 unit
+        if (!ing) {
+          missingInputs.push({ ingredientId: input.ingredientId, ingredientName: '[Deleted]', requiredPerUnit: input.qtyPerUnit, available: 0, unit: '?' });
+        } else if (ing.stockQty < needed) {
+          missingInputs.push({ ingredientId: input.ingredientId, ingredientName: ing.name, requiredPerUnit: input.qtyPerUnit, available: ing.stockQty, unit: ing.unit });
+        }
+      }
+      // canPrepare means at least 1 unit can be made
+      return { canPrepare: missingInputs.length === 0, isUnlinked: false, missingInputs };
+    };
+
+    const maxPreparableUnits = (intermediate, ingredients) => {
+      if (!intermediate.inputIngredients || intermediate.inputIngredients.length === 0) return 0;
+      const ingredientMap = new Map(ingredients.map(i => [i.id, i]));
+      let maxUnits = Infinity;
+      for (const input of intermediate.inputIngredients) {
+        const ing = ingredientMap.get(input.ingredientId);
+        if (!ing || input.qtyPerUnit <= 0) return 0;
+        maxUnits = Math.min(maxUnits, Math.floor(ing.stockQty / input.qtyPerUnit));
+      }
+      return maxUnits === Infinity ? 0 : maxUnits;
+    };
+
+    // ============== ICONS ==============
+    const Icons = {
+      Package: () => <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16.5 9.4 7.55 4.24"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.29 7 12 12 20.71 7"/><line x1="12" x2="12" y1="22" y2="12"/></svg>,
+      UtensilsCrossed: () => <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m16 2-2.3 2.3a3 3 0 0 0 0 4.2l1.8 1.8a3 3 0 0 0 4.2 0L22 8"/><path d="M15 15 3.3 3.3a4.2 4.2 0 0 0 0 6l7.3 7.3c.7.7 2 .7 2.8 0L15 15Zm0 0 7 7"/><path d="m2.1 21.8 6.4-6.3"/><path d="m19 5-7 7"/></svg>,
+      ShoppingCart: () => <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg>,
+      ShoppingCartSmall: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg>,
+      Plus: () => <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>,
+      Edit: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>,
+      Trash: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>,
+      X: () => <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>,
+      ChefHat: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17 21a1 1 0 0 0 1-1v-5.35c0-.457.316-.844.727-1.041a4 4 0 0 0-2.134-7.589 5 5 0 0 0-9.186 0 4 4 0 0 0-2.134 7.588c.411.198.727.585.727 1.041V20a1 1 0 0 0 1 1Z"/><path d="M6 17h12"/></svg>,
+      Check: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>,
+      CheckCircle: () => <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg>,
+      Clock: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
+      Alert: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>,
+      Help: () => <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>,
+      Flag: () => <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" x2="4" y1="22" y2="15"/></svg>,
+      CheckSquare: () => <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg>,
+      Square: () => <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/></svg>,
+      // Intermediate icon (beaker/flask)
+      Beaker: () => <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4.5 3h15"/><path d="M6 3v16a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V3"/><path d="M6 14h12"/></svg>,
+      BeakerSmall: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4.5 3h15"/><path d="M6 3v16a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V3"/><path d="M6 14h12"/></svg>,
+      Play: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>,
+      ChevronDown: () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>,
+    };
+
+    // ============== COMMON COMPONENTS ==============
+    const Modal = ({ isOpen, onClose, title, children }) => {
+      if (!isOpen) return null;
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-charcoal/50 backdrop-blur-sm" onClick={onClose} />
+          <div className="relative w-full max-w-md bg-white rounded-2xl shadow-lg animate-fadeIn max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-light-gray/30 sticky top-0 bg-white z-10">
+              <h2 className="font-semibold text-xl text-charcoal">{title}</h2>
+              <button onClick={onClose} className="p-2 -mr-2 rounded-lg text-warm-gray hover:text-charcoal hover:bg-light-gray/30"><Icons.X /></button>
+            </div>
+            <div className="px-6 py-4">{children}</div>
+          </div>
+        </div>
+      );
+    };
+
+    const SpoilageBadge = ({ status, daysRemaining }) => {
+      const config = {
+        Fresh: { bg: 'bg-sage/20', text: 'text-sage-dark', label: 'Fresh', icon: Icons.Check },
+        NearExpiry: { bg: 'bg-butter/40', text: 'text-yellow-700', label: 'Expires soon', icon: Icons.Clock },
+        Expired: { bg: 'bg-tomato/20', text: 'text-tomato', label: 'Expired', icon: Icons.Alert },
+        Unknown: { bg: 'bg-light-gray/30', text: 'text-warm-gray', label: 'No data', icon: Icons.Help },
+      }[status] || { bg: 'bg-light-gray/30', text: 'text-warm-gray', label: 'Unknown', icon: Icons.Help };
+      const Icon = config.icon;
+      const daysText = daysRemaining !== null ? (daysRemaining < 0 ? `${Math.abs(daysRemaining)}d ago` : daysRemaining === 0 ? 'Today' : `${daysRemaining}d left`) : null;
+      return (
+        <span className={`inline-flex items-center gap-1.5 rounded-full text-xs px-2 py-0.5 font-medium ${config.bg} ${config.text}`}>
+          <Icon /><span>{config.label}</span>{daysText && <span className="opacity-75">· {daysText}</span>}
+        </span>
+      );
+    };
+
+    const AvailabilityBadge = ({ canCook, isUnlinked }) => {
+      if (isUnlinked) return <span className="inline-flex items-center gap-1.5 rounded-full text-xs px-2 py-0.5 font-medium bg-amber-100 text-amber-700"><Icons.Alert /><span>⚠ Unlinked</span></span>;
+      if (canCook) return <span className="inline-flex items-center gap-1.5 rounded-full text-xs px-2 py-0.5 font-medium bg-sage/20 text-sage-dark"><Icons.Check /><span>Ready</span></span>;
+      return <span className="inline-flex items-center gap-1.5 rounded-full text-xs px-2 py-0.5 font-medium bg-tomato/10 text-tomato"><Icons.Alert /><span>Missing items</span></span>;
+    };
+
+    const PriorityBadge = ({ priority }) => {
+      const config = {
+        1: { bg: 'bg-tomato/10', text: 'text-tomato', label: 'Urgent' },
+        2: { bg: 'bg-amber-100', text: 'text-amber-700', label: 'High' },
+        3: { bg: 'bg-light-gray/30', text: 'text-charcoal', label: 'Normal' },
+        4: { bg: 'bg-light-gray/20', text: 'text-warm-gray', label: 'Low' },
+        5: { bg: 'bg-light-gray/20', text: 'text-light-gray', label: 'Someday' },
+      }[priority] || { bg: 'bg-light-gray/30', text: 'text-charcoal', label: `P${priority}` };
+      return <span className={`inline-flex items-center gap-1 rounded-full text-xs px-2 py-0.5 font-medium ${config.bg} ${config.text}`}><Icons.Flag /><span>{config.label}</span></span>;
+    };
+
+    // ============== INGREDIENT COMPONENTS ==============
+    const IngredientCard = ({ ingredient, onBuy, onEdit, onDelete }) => (
+      <div className="bg-white rounded-xl border border-light-gray/30 shadow-sm hover:shadow-md transition-all overflow-hidden animate-fadeIn">
+        <div className="p-4 pb-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex-1 min-w-0">
+              <h3 className="font-semibold text-lg text-charcoal truncate">{ingredient.name}</h3>
+              <div className="mt-1 flex items-center gap-2">
+                <span className={`text-sm font-medium ${ingredient.inStock ? 'text-charcoal' : 'text-tomato'}`}>{ingredient.stockQty} {ingredient.unit}</span>
+              </div>
+            </div>
+            <SpoilageBadge status={ingredient.spoilageStatus} daysRemaining={ingredient.daysRemaining} />
+          </div>
+        </div>
+        <div className="px-4 pb-3"><p className="text-xs text-warm-gray">Shelf life: {ingredient.shelfLifeDays} days</p></div>
+        <div className="border-t border-light-gray/30 bg-warm-white/50 px-2 py-2 flex gap-1">
+          <button onClick={() => onBuy(ingredient)} className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium text-terracotta hover:bg-terracotta/10"><Icons.ShoppingCartSmall /><span>Buy</span></button>
+          <button onClick={() => onEdit(ingredient)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-light-gray/30 hover:text-charcoal"><Icons.Edit /></button>
+          <button onClick={() => onDelete(ingredient)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-tomato/10 hover:text-tomato"><Icons.Trash /></button>
+        </div>
+      </div>
+    );
+
+    const IngredientForm = ({ initialData, onSubmit, onCancel }) => {
+      const [name, setName] = useState(initialData?.name || '');
+      const [unit, setUnit] = useState(initialData?.unit || 'pieces');
+      const [stockQty, setStockQty] = useState(initialData?.stockQty ?? 0);
+      const [shelfLifeDays, setShelfLifeDays] = useState(initialData?.shelfLifeDays || 7);
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        if (!name.trim()) return alert('Name is required');
+        if (shelfLifeDays <= 0) return alert('Shelf life must be greater than 0');
+        onSubmit({ name: name.trim(), unit, stockQty, shelfLifeDays });
+      };
+      const units = ['pieces', 'g', 'kg', 'ml', 'L', 'cups', 'tbsp', 'tsp'];
+      return (
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div><label className="block text-sm font-medium text-charcoal mb-1">Name *</label><input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="e.g., Tomato" className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta" /></div>
+          <div><label className="block text-sm font-medium text-charcoal mb-1">Unit *</label><select value={unit} onChange={e => setUnit(e.target.value)} className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30">{units.map(u => <option key={u} value={u}>{u}</option>)}</select></div>
+          <div><label className="block text-sm font-medium text-charcoal mb-1">Current Stock</label><input type="number" value={stockQty} onChange={e => setStockQty(parseFloat(e.target.value) || 0)} min="0" step="0.1" className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30" /></div>
+          <div><label className="block text-sm font-medium text-charcoal mb-1">Shelf Life (days) *</label><input type="number" value={shelfLifeDays} onChange={e => setShelfLifeDays(parseInt(e.target.value) || 1)} min="1" className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30" /></div>
+          <div className="flex gap-3 pt-4 border-t border-light-gray/30">
+            <button type="button" onClick={onCancel} className="flex-1 px-4 py-2.5 rounded-lg border border-light-gray/50 text-warm-gray font-medium hover:bg-light-gray/20">Cancel</button>
+            <button type="submit" className="flex-1 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark">{initialData ? 'Update' : 'Add'}</button>
+          </div>
+        </form>
+      );
+    };
+
+    const BuyDialog = ({ ingredient, suggestedQty, onConfirm, onCancel }) => {
+      const [qty, setQty] = useState(suggestedQty || 1);
+      return (
+        <div className="space-y-4">
+          <div className="bg-warm-white rounded-xl p-4">
+            <h3 className="font-semibold text-lg text-charcoal">{ingredient.name}</h3>
+            <p className="text-sm text-warm-gray">Current: {ingredient.stockQty} {ingredient.unit}</p>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-charcoal mb-1">Purchase Quantity</label>
+            <input type="number" value={qty} onChange={e => setQty(parseFloat(e.target.value) || 0)} min="0.1" step="0.1" className="w-full px-4 py-3 rounded-lg border border-light-gray/50 text-lg focus:outline-none focus:ring-2 focus:ring-terracotta/30" autoFocus />
+            {suggestedQty && <p className="mt-1 text-xs text-sage-dark">Suggested: {suggestedQty} {ingredient.unit} (to cover deficit)</p>}
+          </div>
+          <div className="bg-sage/10 rounded-xl p-4 flex justify-between">
+            <div><span className="text-sm text-warm-gray">Current</span><div className="font-medium text-charcoal">{ingredient.stockQty} {ingredient.unit}</div></div>
+            <div className="text-right"><span className="text-sm text-warm-gray">After</span><div className="font-medium text-sage-dark">{(ingredient.stockQty + qty).toFixed(1)} {ingredient.unit}</div></div>
+          </div>
+          <div className="flex gap-3">
+            <button onClick={onCancel} className="flex-1 px-4 py-2.5 rounded-lg border border-light-gray/50 text-warm-gray font-medium hover:bg-light-gray/20">Cancel</button>
+            <button onClick={() => qty > 0 && onConfirm(qty)} className="flex-1 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark">Record Purchase</button>
+          </div>
+        </div>
+      );
+    };
+
+    // ============== INTERMEDIATE COMPONENTS ==============
+    const IntermediateCard = ({ intermediate, ingredients, onPrepare, onEdit, onDelete }) => {
+      const prepAvail = computePrepareAvailability(intermediate, ingredients);
+      const maxUnits = maxPreparableUnits(intermediate, ingredients);
+      return (
+        <div className="bg-white rounded-xl border border-light-gray/30 shadow-sm hover:shadow-md transition-all overflow-hidden animate-fadeIn">
+          <div className="p-4 pb-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-plum"><Icons.BeakerSmall /></span>
+                  <h3 className="font-semibold text-lg text-charcoal truncate">{intermediate.name}</h3>
+                </div>
+                <div className="mt-1 flex items-center gap-2">
+                  <span className={`text-sm font-medium ${intermediate.stockQty > 0 ? 'text-charcoal' : 'text-tomato'}`}>{intermediate.stockQty} {intermediate.unit} in stock</span>
+                </div>
+              </div>
+              {prepAvail.isUnlinked ? (
+                <span className="inline-flex items-center gap-1 rounded-full text-xs px-2 py-0.5 font-medium bg-amber-100 text-amber-700"><Icons.Alert /> No inputs</span>
+              ) : prepAvail.canPrepare ? (
+                <span className="inline-flex items-center gap-1 rounded-full text-xs px-2 py-0.5 font-medium bg-sage/20 text-sage-dark"><Icons.Check /> Can prepare</span>
+              ) : (
+                <span className="inline-flex items-center gap-1 rounded-full text-xs px-2 py-0.5 font-medium bg-tomato/10 text-tomato"><Icons.Alert /> Missing inputs</span>
+              )}
+            </div>
+          </div>
+          <div className="px-4 pb-3">
+            <p className="text-xs text-warm-gray mb-1">Input ingredients ({(intermediate.inputIngredients || []).length}):</p>
+            <div className="flex flex-wrap gap-1">
+              {(intermediate.inputIngredients || []).map(input => {
+                const ing = ingredients.find(i => i.id === input.ingredientId);
+                return <span key={input.ingredientId} className="text-xs px-2 py-0.5 rounded-full bg-light-gray/20 text-warm-gray">{ing?.name || '[Deleted]'} ×{input.qtyPerUnit}/{intermediate.unit}</span>;
+              })}
+            </div>
+            {maxUnits > 0 && <p className="text-xs text-sage-dark mt-1">Can make up to {maxUnits} {intermediate.unit}</p>}
+          </div>
+          <div className="border-t border-light-gray/30 bg-warm-white/50 px-2 py-2 flex gap-1">
+            <button onClick={() => onPrepare(intermediate)} disabled={!prepAvail.canPrepare} className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium ${prepAvail.canPrepare ? 'text-plum hover:bg-plum/10' : 'text-light-gray cursor-not-allowed'}`}><Icons.Play /><span>Prepare</span></button>
+            <button onClick={() => onEdit(intermediate)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-light-gray/30 hover:text-charcoal"><Icons.Edit /></button>
+            <button onClick={() => onDelete(intermediate)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-tomato/10 hover:text-tomato"><Icons.Trash /></button>
+          </div>
+        </div>
+      );
+    };
+
+    const IntermediateForm = ({ initialData, ingredients, onSubmit, onCancel }) => {
+      const [name, setName] = useState(initialData?.name || '');
+      const [unit, setUnit] = useState(initialData?.unit || 'portions');
+      const [stockQty, setStockQty] = useState(initialData?.stockQty ?? 0);
+      const [inputIngredients, setInputIngredients] = useState(initialData?.inputIngredients || []);
+
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        if (!name.trim()) return alert('Name is required');
+        onSubmit({ name: name.trim(), unit, stockQty, inputIngredients });
+      };
+
+      const addInput = () => {
+        const unused = ingredients.filter(i => !inputIngredients.some(inp => inp.ingredientId === i.id));
+        if (unused.length === 0) return;
+        setInputIngredients([...inputIngredients, { ingredientId: unused[0].id, qtyPerUnit: 1 }]);
+      };
+
+      const removeInput = (idx) => setInputIngredients(inputIngredients.filter((_, i) => i !== idx));
+
+      const updateInput = (idx, field, value) => {
+        const updated = [...inputIngredients];
+        updated[idx] = { ...updated[idx], [field]: value };
+        setInputIngredients(updated);
+      };
+
+      const units = ['portions', 'batches', 'cups', 'L', 'ml', 'pieces', 'g', 'kg'];
+
+      return (
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div><label className="block text-sm font-medium text-charcoal mb-1">Name *</label><input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="e.g., Tomato Sauce" className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-plum/30 focus:border-plum" /></div>
+          <div><label className="block text-sm font-medium text-charcoal mb-1">Unit</label><select value={unit} onChange={e => setUnit(e.target.value)} className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-plum/30">{units.map(u => <option key={u} value={u}>{u}</option>)}</select></div>
+          <div><label className="block text-sm font-medium text-charcoal mb-1">Current Stock</label><input type="number" value={stockQty} onChange={e => setStockQty(parseFloat(e.target.value) || 0)} min="0" step="0.1" className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-plum/30" /></div>
+
+          <div className="border-t border-light-gray/30 pt-4">
+            <div className="flex justify-between items-center mb-2">
+              <label className="text-sm font-medium text-charcoal">Input Ingredients (per 1 {unit})</label>
+              <button type="button" onClick={addInput} className="text-sm text-plum hover:text-plum-dark flex items-center gap-1"><Icons.Plus /> Add</button>
+            </div>
+            {inputIngredients.length === 0 ? (
+              <p className="text-sm text-amber-600 italic py-2">⚠ No inputs defined</p>
+            ) : (
+              <div className="space-y-2">
+                {inputIngredients.map((entry, idx) => {
+                  const ing = ingredients.find(i => i.id === entry.ingredientId);
+                  return (
+                    <div key={idx} className="flex gap-2 items-center">
+                      <select value={entry.ingredientId} onChange={e => updateInput(idx, 'ingredientId', e.target.value)} className="flex-1 px-3 py-2 rounded-lg border border-light-gray/50 text-sm">
+                        {ingredients.map(i => <option key={i.id} value={i.id}>{i.name}</option>)}
+                      </select>
+                      <input type="number" value={entry.qtyPerUnit} onChange={e => updateInput(idx, 'qtyPerUnit', parseFloat(e.target.value) || 0)} min="0.1" step="0.1" className="w-20 px-3 py-2 rounded-lg border border-light-gray/50 text-sm text-center" />
+                      <span className="text-xs text-warm-gray w-10">{ing?.unit}</span>
+                      <button type="button" onClick={() => removeInput(idx)} className="p-2 text-warm-gray hover:text-tomato"><Icons.Trash /></button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="flex gap-3 pt-4 border-t border-light-gray/30">
+            <button type="button" onClick={onCancel} className="flex-1 px-4 py-2.5 rounded-lg border border-light-gray/50 text-warm-gray font-medium hover:bg-light-gray/20">Cancel</button>
+            <button type="submit" className="flex-1 px-4 py-2.5 rounded-lg bg-plum text-white font-medium hover:bg-plum-dark">{initialData ? 'Update' : 'Add'}</button>
+          </div>
+        </form>
+      );
+    };
+
+    const PrepareDialog = ({ intermediate, ingredients, onConfirm, onCancel }) => {
+      const max = maxPreparableUnits(intermediate, ingredients);
+      const [units, setUnits] = useState(Math.min(1, max));
+      const ingredientMap = new Map(ingredients.map(i => [i.id, i]));
+
+      return (
+        <div className="space-y-4">
+          <div className="bg-plum/5 rounded-xl p-4">
+            <h3 className="font-semibold text-lg text-charcoal">{intermediate.name}</h3>
+            <p className="text-sm text-warm-gray">Current stock: {intermediate.stockQty} {intermediate.unit}</p>
+            <p className="text-sm text-sage-dark">Max preparable: {max} {intermediate.unit}</p>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-charcoal mb-1">Units to Prepare</label>
+            <input type="number" value={units} onChange={e => setUnits(Math.min(max, Math.max(0, parseFloat(e.target.value) || 0)))} min="1" max={max} step="1" className="w-full px-4 py-3 rounded-lg border border-light-gray/50 text-lg focus:outline-none focus:ring-2 focus:ring-plum/30" autoFocus />
+          </div>
+          {units > 0 && (
+            <div className="bg-warm-white rounded-xl p-4">
+              <p className="text-sm text-warm-gray mb-2">Will deduct:</p>
+              <div className="space-y-1">
+                {(intermediate.inputIngredients || []).map(input => {
+                  const ing = ingredientMap.get(input.ingredientId);
+                  const deduction = units * input.qtyPerUnit;
+                  return (
+                    <div key={input.ingredientId} className="flex justify-between text-sm">
+                      <span className="text-charcoal">{ing?.name || '[Deleted]'}</span>
+                      <span className="text-warm-gray">-{deduction} {ing?.unit} <span className="text-xs">(have {ing?.stockQty})</span></span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="mt-3 pt-3 border-t border-light-gray/30 flex justify-between text-sm font-medium">
+                <span className="text-charcoal">{intermediate.name}</span>
+                <span className="text-plum">+{units} {intermediate.unit} → {intermediate.stockQty + units}</span>
+              </div>
+            </div>
+          )}
+          <div className="flex gap-3">
+            <button onClick={onCancel} className="flex-1 px-4 py-2.5 rounded-lg border border-light-gray/50 text-warm-gray font-medium hover:bg-light-gray/20">Cancel</button>
+            <button onClick={() => units > 0 && units <= max && onConfirm(units)} disabled={units <= 0 || units > max} className={`flex-1 px-4 py-2.5 rounded-lg font-medium ${units > 0 && units <= max ? 'bg-plum text-white hover:bg-plum-dark' : 'bg-light-gray/30 text-light-gray cursor-not-allowed'}`}>Prepare Now</button>
+          </div>
+        </div>
+      );
+    };
+
+    // ============== DISH COMPONENTS ==============
+    const DishCard = ({ dish, ingredients, intermediates, onCook, onEdit, onDelete }) => {
+      const isCooked = dish.status === 'Cooked';
+      const missingAll = [...(dish.missingIngredients || []).map(m => m.ingredientName), ...(dish.missingIntermediates || []).map(m => m.intermediateName)];
+      return (
+        <div className={`bg-white rounded-xl border shadow-sm hover:shadow-md transition-all overflow-hidden animate-fadeIn ${isCooked ? 'border-sage/30 opacity-75' : 'border-light-gray/30'}`}>
+          <div className="p-4 pb-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex-1 min-w-0">
+                <h3 className={`font-semibold text-lg truncate ${isCooked ? 'text-warm-gray' : 'text-charcoal'}`}>{dish.name}</h3>
+                <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${dish.status === 'Planned' ? 'bg-blue-100 text-blue-700' : dish.status === 'InProgress' ? 'bg-amber-100 text-amber-700' : 'bg-sage/20 text-sage-dark'}`}>{dish.status}</span>
+                  <PriorityBadge priority={dish.priority} />
+                </div>
+              </div>
+            </div>
+          </div>
+          {dish.isActive && (
+            <div className="px-4 pb-3">
+              <AvailabilityBadge canCook={dish.canCook} isUnlinked={dish.isUnlinked} />
+              {missingAll.length > 0 && (
+                <div className="mt-2 text-xs text-warm-gray"><span className="text-tomato">Missing: </span>{missingAll.join(', ')}</div>
+              )}
+            </div>
+          )}
+          <div className="px-4 pb-3 text-xs text-warm-gray">
+            {(dish.recipeIngredients || []).length} ingredient(s), {(dish.recipeIntermediates || []).length} intermediate(s)
+          </div>
+          <div className="border-t border-light-gray/30 bg-warm-white/50 px-2 py-2 flex gap-1">
+            {dish.isActive && (
+              <button onClick={() => onCook(dish)} disabled={!dish.canCook} className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium ${dish.canCook ? 'text-sage-dark hover:bg-sage/20' : 'text-light-gray cursor-not-allowed'}`}><Icons.ChefHat /><span>Cook</span></button>
+            )}
+            <button onClick={() => onEdit(dish)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-light-gray/30 hover:text-charcoal"><Icons.Edit /></button>
+            <button onClick={() => onDelete(dish)} className="px-3 py-2 rounded-lg text-warm-gray hover:bg-tomato/10 hover:text-tomato"><Icons.Trash /></button>
+          </div>
+        </div>
+      );
+    };
+
+    const DishForm = ({ initialData, ingredients, intermediates, onSubmit, onCancel }) => {
+      const [name, setName] = useState(initialData?.name || '');
+      const [priority, setPriority] = useState(initialData?.priority || 3);
+      const [recipeIngredients, setRecipeIngredients] = useState(initialData?.recipeIngredients || []);
+      const [recipeIntermediates, setRecipeIntermediates] = useState(initialData?.recipeIntermediates || []);
+
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        if (!name.trim()) return alert('Name is required');
+        onSubmit({ name: name.trim(), priority, recipeIngredients, recipeIntermediates });
+      };
+
+      // Ingredient rows
+      const addIngredient = () => {
+        const unused = ingredients.filter(i => !recipeIngredients.some(r => r.ingredientId === i.id));
+        if (unused.length === 0) return;
+        setRecipeIngredients([...recipeIngredients, { ingredientId: unused[0].id, qty: 1 }]);
+      };
+      const removeIngredient = (idx) => setRecipeIngredients(recipeIngredients.filter((_, i) => i !== idx));
+      const updateIngredient = (idx, field, value) => {
+        const u = [...recipeIngredients]; u[idx] = { ...u[idx], [field]: value }; setRecipeIngredients(u);
+      };
+
+      // Intermediate rows
+      const addIntermediate = () => {
+        const unused = intermediates.filter(i => !recipeIntermediates.some(r => r.intermediateId === i.id));
+        if (unused.length === 0) return;
+        setRecipeIntermediates([...recipeIntermediates, { intermediateId: unused[0].id, qty: 1 }]);
+      };
+      const removeIntermediate = (idx) => setRecipeIntermediates(recipeIntermediates.filter((_, i) => i !== idx));
+      const updateIntermediate = (idx, field, value) => {
+        const u = [...recipeIntermediates]; u[idx] = { ...u[idx], [field]: value }; setRecipeIntermediates(u);
+      };
+
+      return (
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div><label className="block text-sm font-medium text-charcoal mb-1">Dish Name *</label><input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="e.g., Pasta Marinara" className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30" /></div>
+          <div><label className="block text-sm font-medium text-charcoal mb-1">Priority</label>
+            <select value={priority} onChange={e => setPriority(parseInt(e.target.value))} className="w-full px-4 py-2.5 rounded-lg border border-light-gray/50 focus:outline-none focus:ring-2 focus:ring-terracotta/30">
+              <option value={1}>1 - Urgent</option><option value={2}>2 - High</option><option value={3}>3 - Normal</option><option value={4}>4 - Low</option><option value={5}>5 - Someday</option>
+            </select>
+          </div>
+
+          {/* Recipe Ingredients */}
+          <div className="border-t border-light-gray/30 pt-4">
+            <div className="flex justify-between items-center mb-2">
+              <label className="text-sm font-medium text-charcoal">Ingredients</label>
+              <button type="button" onClick={addIngredient} className="text-sm text-terracotta hover:text-terracotta-dark flex items-center gap-1"><Icons.Plus /> Add</button>
+            </div>
+            {recipeIngredients.length === 0 ? (
+              <p className="text-xs text-warm-gray italic py-1">None added</p>
+            ) : (
+              <div className="space-y-2">
+                {recipeIngredients.map((entry, idx) => {
+                  const ing = ingredients.find(i => i.id === entry.ingredientId);
+                  return (
+                    <div key={idx} className="flex gap-2 items-center">
+                      <select value={entry.ingredientId} onChange={e => updateIngredient(idx, 'ingredientId', e.target.value)} className="flex-1 px-3 py-2 rounded-lg border border-light-gray/50 text-sm">{ingredients.map(i => <option key={i.id} value={i.id}>{i.name}</option>)}</select>
+                      <input type="number" value={entry.qty} onChange={e => updateIngredient(idx, 'qty', parseFloat(e.target.value) || 0)} min="0.1" step="0.1" className="w-20 px-3 py-2 rounded-lg border border-light-gray/50 text-sm text-center" />
+                      <span className="text-xs text-warm-gray w-10">{ing?.unit}</span>
+                      <button type="button" onClick={() => removeIngredient(idx)} className="p-2 text-warm-gray hover:text-tomato"><Icons.Trash /></button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Recipe Intermediates */}
+          <div className="border-t border-light-gray/30 pt-4">
+            <div className="flex justify-between items-center mb-2">
+              <label className="text-sm font-medium text-charcoal flex items-center gap-1.5"><Icons.BeakerSmall /> Intermediates</label>
+              <button type="button" onClick={addIntermediate} className="text-sm text-plum hover:text-plum-dark flex items-center gap-1"><Icons.Plus /> Add</button>
+            </div>
+            {recipeIntermediates.length === 0 ? (
+              <p className="text-xs text-warm-gray italic py-1">None added</p>
+            ) : (
+              <div className="space-y-2">
+                {recipeIntermediates.map((entry, idx) => {
+                  const inter = intermediates.find(i => i.id === entry.intermediateId);
+                  return (
+                    <div key={idx} className="flex gap-2 items-center">
+                      <select value={entry.intermediateId} onChange={e => updateIntermediate(idx, 'intermediateId', e.target.value)} className="flex-1 px-3 py-2 rounded-lg border border-light-gray/50 text-sm">{intermediates.map(i => <option key={i.id} value={i.id}>{i.name}</option>)}</select>
+                      <input type="number" value={entry.qty} onChange={e => updateIntermediate(idx, 'qty', parseFloat(e.target.value) || 0)} min="0.1" step="0.1" className="w-20 px-3 py-2 rounded-lg border border-light-gray/50 text-sm text-center" />
+                      <span className="text-xs text-warm-gray w-10">{inter?.unit}</span>
+                      <button type="button" onClick={() => removeIntermediate(idx)} className="p-2 text-warm-gray hover:text-tomato"><Icons.Trash /></button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {recipeIngredients.length === 0 && recipeIntermediates.length === 0 && (
+            <p className="text-sm text-amber-600 italic">⚠ No ingredients or intermediates — dish will be "Unlinked"</p>
+          )}
+
+          <div className="flex gap-3 pt-4 border-t border-light-gray/30">
+            <button type="button" onClick={onCancel} className="flex-1 px-4 py-2.5 rounded-lg border border-light-gray/50 text-warm-gray font-medium hover:bg-light-gray/20">Cancel</button>
+            <button type="submit" className="flex-1 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark">{initialData ? 'Update' : 'Add'}</button>
+          </div>
+        </form>
+      );
+    };
+
+    // ============== SHOPPING LIST ITEM ==============
+    const ShoppingListItem = ({ item, type, onAction }) => {
+      const [isExpanded, setIsExpanded] = useState(false);
+      const isBuy = type === 'ingredient';
+      const needsAction = isBuy ? item.needsToBuy : item.needsToPrepare;
+      const deficit = item.deficit;
+
+      return (
+        <div className={`bg-white rounded-xl border overflow-hidden animate-fadeIn ${needsAction ? 'border-tomato/30' : 'border-sage/30'}`}>
+          <div className="p-4">
+            <div className="flex items-center gap-3">
+              <div className={`flex-shrink-0 ${needsAction ? 'text-light-gray' : 'text-sage'}`}>
+                {needsAction ? <Icons.Square /> : <Icons.CheckSquare />}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  {!isBuy && <span className="text-plum"><Icons.BeakerSmall /></span>}
+                  <h3 className={`font-semibold ${needsAction ? 'text-charcoal' : 'text-warm-gray line-through'}`}>{isBuy ? item.ingredientName : item.intermediateName}</h3>
+                  <PriorityBadge priority={item.derivedPriority} />
+                </div>
+                <div className="mt-1 flex items-center gap-4 text-sm">
+                  <span className="text-warm-gray">Have: <span className="font-medium text-charcoal">{item.currentStock} {item.unit}</span></span>
+                  <span className="text-warm-gray">Need: <span className="font-medium text-charcoal">{item.totalRequired} {item.unit}</span></span>
+                  {needsAction && <span className="text-tomato font-medium">{isBuy ? 'Buy' : 'Prepare'}: {deficit} {item.unit}</span>}
+                </div>
+              </div>
+              {needsAction && (
+                <button onClick={() => onAction(item)} className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-white text-sm font-medium ${isBuy ? 'bg-terracotta hover:bg-terracotta-dark' : 'bg-plum hover:bg-plum-dark'}`}>
+                  {isBuy ? <><Icons.ShoppingCartSmall /> Buy</> : <><Icons.Play /> Prep</>}
+                </button>
+              )}
+              <button onClick={() => setIsExpanded(!isExpanded)} className="p-2 text-warm-gray hover:text-charcoal">
+                <span className={`inline-block transform transition-transform ${isExpanded ? 'rotate-180' : ''}`}><Icons.ChevronDown /></span>
+              </button>
+            </div>
+          </div>
+          {isExpanded && (
+            <div className="px-4 pb-4 pt-0">
+              <div className="bg-warm-white rounded-lg p-3">
+                <p className="text-xs text-warm-gray mb-2">Used in:</p>
+                <div className="space-y-1">
+                  {item.usedByDishes.map((dish, idx) => (
+                    <div key={idx} className="flex items-center justify-between text-sm">
+                      <span className="text-charcoal">{dish.dishName}</span>
+                      <span className="text-warm-gray">{dish.qty} {item.unit}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    };
+
+    // ============== PAGES ==============
+    const IngredientsPage = ({ ingredients, onAdd, onEdit, onDelete, onBuy }) => {
+      const [modal, setModal] = useState({ type: null, data: null });
+      const toast = useToast();
+      return (
+        <div className="min-h-screen bg-cream pb-24">
+          <header className="bg-white border-b border-light-gray/30 sticky top-0 z-10">
+            <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-terracotta/10 flex items-center justify-center text-terracotta"><Icons.Package /></div>
+                <div><h1 className="font-semibold text-xl text-charcoal">Ingredients</h1><p className="text-sm text-warm-gray">{ingredients.length} items</p></div>
+              </div>
+              <button onClick={() => setModal({ type: 'add' })} className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark"><Icons.Plus /><span className="hidden sm:inline">Add</span></button>
+            </div>
+          </header>
+          <main className="max-w-4xl mx-auto px-4 py-6">
+            {ingredients.length === 0 ? (
+              <div className="text-center py-16">
+                <div className="w-16 h-16 rounded-full bg-light-gray/30 flex items-center justify-center mx-auto mb-4 text-light-gray"><Icons.Package /></div>
+                <h3 className="font-semibold text-lg text-charcoal mb-2">No ingredients yet</h3>
+                <p className="text-warm-gray mb-6">Start by adding ingredients you use.</p>
+                <button onClick={() => setModal({ type: 'add' })} className="px-5 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark">Add First Ingredient</button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {ingredients.map(ing => <IngredientCard key={ing.id} ingredient={ing} onBuy={() => setModal({ type: 'buy', data: ing })} onEdit={() => setModal({ type: 'edit', data: ing })} onDelete={() => { if (confirm(`Delete "${ing.name}"?`)) onDelete(ing.id); }} />)}
+              </div>
+            )}
+          </main>
+          <Modal isOpen={modal.type === 'add'} onClose={() => setModal({ type: null })} title="Add Ingredient">
+            <IngredientForm onSubmit={(data) => { onAdd(data); setModal({ type: null }); toast('Ingredient added', 'success'); }} onCancel={() => setModal({ type: null })} />
+          </Modal>
+          <Modal isOpen={modal.type === 'edit'} onClose={() => setModal({ type: null })} title="Edit Ingredient">
+            {modal.data && <IngredientForm initialData={modal.data} onSubmit={(data) => { onEdit(modal.data.id, data); setModal({ type: null }); toast('Ingredient updated', 'success'); }} onCancel={() => setModal({ type: null })} />}
+          </Modal>
+          <Modal isOpen={modal.type === 'buy'} onClose={() => setModal({ type: null })} title="Record Purchase">
+            {modal.data && <BuyDialog ingredient={modal.data} onConfirm={(qty) => { onBuy(modal.data.id, qty); setModal({ type: null }); toast(`Purchased ${qty} ${modal.data.unit}`, 'success'); }} onCancel={() => setModal({ type: null })} />}
+          </Modal>
+        </div>
+      );
+    };
+
+    const IntermediatesPage = ({ intermediates, ingredients, onAdd, onEdit, onDelete, onPrepare }) => {
+      const [modal, setModal] = useState({ type: null, data: null });
+      const toast = useToast();
+      return (
+        <div className="min-h-screen bg-cream pb-24">
+          <header className="bg-white border-b border-light-gray/30 sticky top-0 z-10">
+            <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-plum/10 flex items-center justify-center text-plum"><Icons.Beaker /></div>
+                <div><h1 className="font-semibold text-xl text-charcoal">Intermediates</h1><p className="text-sm text-warm-gray">Sauces, doughs, stocks…</p></div>
+              </div>
+              <button onClick={() => setModal({ type: 'add' })} className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-plum text-white font-medium hover:bg-plum-dark"><Icons.Plus /><span className="hidden sm:inline">Add</span></button>
+            </div>
+          </header>
+          <main className="max-w-4xl mx-auto px-4 py-6">
+            {intermediates.length === 0 ? (
+              <div className="text-center py-16">
+                <div className="w-16 h-16 rounded-full bg-light-gray/30 flex items-center justify-center mx-auto mb-4 text-light-gray"><Icons.Beaker /></div>
+                <h3 className="font-semibold text-lg text-charcoal mb-2">No intermediates yet</h3>
+                <p className="text-warm-gray mb-6">Intermediates are prep items like sauces, doughs, or stocks that multiple dishes can share.</p>
+                <button onClick={() => setModal({ type: 'add' })} className="px-5 py-2.5 rounded-lg bg-plum text-white font-medium hover:bg-plum-dark">Add First Intermediate</button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {intermediates.map(inter => <IntermediateCard key={inter.id} intermediate={inter} ingredients={ingredients} onPrepare={() => setModal({ type: 'prepare', data: inter })} onEdit={() => setModal({ type: 'edit', data: inter })} onDelete={() => { if (confirm(`Delete "${inter.name}"?`)) onDelete(inter.id); }} />)}
+              </div>
+            )}
+          </main>
+          <Modal isOpen={modal.type === 'add'} onClose={() => setModal({ type: null })} title="Add Intermediate">
+            <IntermediateForm ingredients={ingredients} onSubmit={(data) => { onAdd(data); setModal({ type: null }); toast('Intermediate added', 'success'); }} onCancel={() => setModal({ type: null })} />
+          </Modal>
+          <Modal isOpen={modal.type === 'edit'} onClose={() => setModal({ type: null })} title="Edit Intermediate">
+            {modal.data && <IntermediateForm initialData={modal.data} ingredients={ingredients} onSubmit={(data) => { onEdit(modal.data.id, data); setModal({ type: null }); toast('Intermediate updated', 'success'); }} onCancel={() => setModal({ type: null })} />}
+          </Modal>
+          <Modal isOpen={modal.type === 'prepare'} onClose={() => setModal({ type: null })} title="Prepare Intermediate">
+            {modal.data && <PrepareDialog intermediate={modal.data} ingredients={ingredients} onConfirm={(units) => { onPrepare(modal.data.id, units); setModal({ type: null }); toast(`Prepared ${units} ${modal.data.unit}`, 'success'); }} onCancel={() => setModal({ type: null })} />}
+          </Modal>
+        </div>
+      );
+    };
+
+    const DishesPage = ({ dishes, ingredients, intermediates, onAdd, onEdit, onDelete, onCook }) => {
+      const [modal, setModal] = useState({ type: null, data: null });
+      const [filter, setFilter] = useState('active');
+      const toast = useToast();
+
+      const filteredDishes = useMemo(() => {
+        let result = dishes;
+        if (filter === 'active') result = dishes.filter(d => d.isActive);
+        else if (filter === 'ready') result = dishes.filter(d => d.isActive && d.canCook);
+        else if (filter === 'cooked') result = dishes.filter(d => !d.isActive);
+        return result.sort((a, b) => (a.isActive === b.isActive ? a.priority - b.priority : a.isActive ? -1 : 1));
+      }, [dishes, filter]);
+
+      return (
+        <div className="min-h-screen bg-cream pb-24">
+          <header className="bg-white border-b border-light-gray/30 sticky top-0 z-10">
+            <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-terracotta/10 flex items-center justify-center text-terracotta"><Icons.UtensilsCrossed /></div>
+                <div><h1 className="font-semibold text-xl text-charcoal">Dishes</h1><p className="text-sm text-warm-gray">Plan & cook meals</p></div>
+              </div>
+              <button onClick={() => setModal({ type: 'add' })} className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark"><Icons.Plus /><span className="hidden sm:inline">Add</span></button>
+            </div>
+          </header>
+          <main className="max-w-4xl mx-auto px-4 py-6">
+            {dishes.length > 0 && (
+              <div className="flex gap-2 mb-6 overflow-x-auto pb-2">
+                {['active', 'ready', 'all', 'cooked'].map(f => (
+                  <button key={f} onClick={() => setFilter(f)} className={`px-3 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap ${filter === f ? 'bg-terracotta text-white' : 'bg-white text-warm-gray hover:bg-light-gray/30'}`}>
+                    {f === 'active' ? 'Active' : f === 'ready' ? 'Ready' : f === 'all' ? 'All' : 'Cooked'}
+                  </button>
+                ))}
+              </div>
+            )}
+            {filteredDishes.length === 0 ? (
+              <div className="text-center py-16">
+                <div className="w-16 h-16 rounded-full bg-light-gray/30 flex items-center justify-center mx-auto mb-4 text-light-gray"><Icons.UtensilsCrossed /></div>
+                <h3 className="font-semibold text-lg text-charcoal mb-2">{dishes.length === 0 ? 'No dishes yet' : 'No dishes match filter'}</h3>
+                {dishes.length === 0 && <button onClick={() => setModal({ type: 'add' })} className="px-5 py-2.5 rounded-lg bg-terracotta text-white font-medium hover:bg-terracotta-dark mt-4">Add First Dish</button>}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {filteredDishes.map(dish => <DishCard key={dish.id} dish={dish} ingredients={ingredients} intermediates={intermediates} onCook={() => setModal({ type: 'cook', data: dish })} onEdit={() => setModal({ type: 'edit', data: dish })} onDelete={() => { if (confirm(`Delete "${dish.name}"?`)) onDelete(dish.id); }} />)}
+              </div>
+            )}
+          </main>
+          <Modal isOpen={modal.type === 'add'} onClose={() => setModal({ type: null })} title="Add Dish">
+            <DishForm ingredients={ingredients} intermediates={intermediates} onSubmit={(data) => { onAdd(data); setModal({ type: null }); toast('Dish added', 'success'); }} onCancel={() => setModal({ type: null })} />
+          </Modal>
+          <Modal isOpen={modal.type === 'edit'} onClose={() => setModal({ type: null })} title="Edit Dish">
+            {modal.data && <DishForm initialData={modal.data} ingredients={ingredients} intermediates={intermediates} onSubmit={(data) => { onEdit(modal.data.id, data); setModal({ type: null }); toast('Dish updated', 'success'); }} onCancel={() => setModal({ type: null })} />}
+          </Modal>
+          <Modal isOpen={modal.type === 'cook'} onClose={() => setModal({ type: null })} title="Cook Dish">
+            {modal.data && (
+              <div className="space-y-4">
+                <div className="bg-sage/10 rounded-xl p-4">
+                  <h3 className="font-semibold text-lg text-charcoal mb-2">{modal.data.name}</h3>
+                  <p className="text-sm text-warm-gray mb-2">This will deduct:</p>
+                  <ul className="text-sm space-y-1">
+                    {(modal.data.recipeIngredients || []).map(entry => {
+                      const ing = ingredients.find(i => i.id === entry.ingredientId);
+                      return <li key={entry.ingredientId} className="flex justify-between"><span>{ing?.name}</span><span className="text-warm-gray">-{entry.qty} {ing?.unit}</span></li>;
+                    })}
+                    {(modal.data.recipeIntermediates || []).map(entry => {
+                      const inter = intermediates.find(i => i.id === entry.intermediateId);
+                      return <li key={entry.intermediateId} className="flex justify-between"><span className="text-plum">{inter?.name}</span><span className="text-warm-gray">-{entry.qty} {inter?.unit}</span></li>;
+                    })}
+                  </ul>
+                </div>
+                <div className="flex gap-3">
+                  <button onClick={() => setModal({ type: null })} className="flex-1 px-4 py-2.5 rounded-lg border border-light-gray/50 text-warm-gray font-medium hover:bg-light-gray/20">Cancel</button>
+                  <button onClick={() => { onCook(modal.data.id); setModal({ type: null }); toast(`"${modal.data.name}" cooked!`, 'success'); }} className="flex-1 px-4 py-2.5 rounded-lg bg-sage text-white font-medium hover:bg-sage-dark">Cook Now</button>
+                </div>
+              </div>
+            )}
+          </Modal>
+        </div>
+      );
+    };
+
+    const ShoppingListPage = ({ shoppingData, ingredients, intermediates, onBuyIngredient, onPrepareIntermediate }) => {
+      const [modal, setModal] = useState({ type: null, data: null });
+      const [tab, setTab] = useState('ingredients');
+      const [showAll, setShowAll] = useState(false);
+      const toast = useToast();
+
+      const displayedIngredients = useMemo(() => {
+        if (showAll) return shoppingData.ingredientShoppingList;
+        return shoppingData.ingredientShoppingList.filter(i => i.needsToBuy);
+      }, [shoppingData, showAll]);
+
+      const displayedIntermediates = useMemo(() => {
+        if (showAll) return shoppingData.intermediateShoppingList;
+        return shoppingData.intermediateShoppingList.filter(i => i.needsToPrepare);
+      }, [shoppingData, showAll]);
+
+      const handleBuyFromList = (item) => {
+        const ing = ingredients.find(i => i.id === item.ingredientId);
+        if (ing) setModal({ type: 'buy', data: { ...ing, suggestedQty: item.deficit } });
+      };
+
+      const handlePrepFromList = (item) => {
+        const inter = intermediates.find(i => i.id === item.intermediateId);
+        if (inter) setModal({ type: 'prepare', data: inter });
+      };
+
+      return (
+        <div className="min-h-screen bg-cream pb-24">
+          <header className="bg-white border-b border-light-gray/30 sticky top-0 z-10">
+            <div className="max-w-4xl mx-auto px-4 py-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-terracotta/10 flex items-center justify-center text-terracotta"><Icons.ShoppingCart /></div>
+                  <div><h1 className="font-semibold text-xl text-charcoal">Shopping List</h1><p className="text-sm text-warm-gray">Auto-generated from dishes</p></div>
+                </div>
+              </div>
+              {(shoppingData.totalIngredientItems > 0 || shoppingData.totalIntermediateItems > 0) && (
+                <div className="mt-4 flex flex-wrap gap-3">
+                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-tomato/10 text-tomato text-sm font-medium"><Icons.ShoppingCartSmall /><span>{shoppingData.ingredientsToBuy} to buy</span></div>
+                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-plum/10 text-plum text-sm font-medium"><Icons.BeakerSmall /><span>{shoppingData.intermediatesToPrepare} to prepare</span></div>
+                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-sage/20 text-sage-dark text-sm font-medium"><Icons.CheckCircle /><span>{shoppingData.ingredientsInStock} in stock</span></div>
+                </div>
+              )}
+            </div>
+          </header>
+          <main className="max-w-4xl mx-auto px-4 py-6">
+            {shoppingData.totalIngredientItems === 0 && shoppingData.totalIntermediateItems === 0 ? (
+              <div className="text-center py-16">
+                <div className="w-16 h-16 rounded-full bg-light-gray/30 flex items-center justify-center mx-auto mb-4 text-light-gray"><Icons.ShoppingCart /></div>
+                <h3 className="font-semibold text-lg text-charcoal mb-2">No items needed</h3>
+                <p className="text-warm-gray">Add dishes to generate a shopping list.</p>
+              </div>
+            ) : (
+              <>
+                {/* Tabs */}
+                <div className="flex gap-2 mb-4">
+                  <button onClick={() => setTab('ingredients')} className={`px-3 py-1.5 rounded-lg text-sm font-medium ${tab === 'ingredients' ? 'bg-terracotta text-white' : 'bg-white text-warm-gray hover:bg-light-gray/30'}`}>
+                    Ingredients ({shoppingData.totalIngredientItems})
+                  </button>
+                  <button onClick={() => setTab('intermediates')} className={`px-3 py-1.5 rounded-lg text-sm font-medium ${tab === 'intermediates' ? 'bg-plum text-white' : 'bg-white text-warm-gray hover:bg-light-gray/30'}`}>
+                    Intermediates ({shoppingData.totalIntermediateItems})
+                  </button>
+                </div>
+
+                {/* Toggle */}
+                <div className="flex gap-2 mb-6">
+                  <button onClick={() => setShowAll(false)} className={`px-3 py-1.5 rounded-lg text-sm font-medium ${!showAll ? 'bg-charcoal text-white' : 'bg-white text-warm-gray hover:bg-light-gray/30'}`}>Needs Action</button>
+                  <button onClick={() => setShowAll(true)} className={`px-3 py-1.5 rounded-lg text-sm font-medium ${showAll ? 'bg-charcoal text-white' : 'bg-white text-warm-gray hover:bg-light-gray/30'}`}>All</button>
+                </div>
+
+                {tab === 'ingredients' && (
+                  <div className="space-y-3">
+                    {displayedIngredients.map(item => <ShoppingListItem key={item.ingredientId} item={item} type="ingredient" onAction={handleBuyFromList} />)}
+                    {displayedIngredients.length === 0 && <div className="text-center py-8 text-warm-gray">{showAll ? 'No ingredient requirements.' : '🎉 All ingredients in stock!'}</div>}
+                  </div>
+                )}
+
+                {tab === 'intermediates' && (
+                  <div className="space-y-3">
+                    {displayedIntermediates.map(item => <ShoppingListItem key={item.intermediateId} item={item} type="intermediate" onAction={handlePrepFromList} />)}
+                    {displayedIntermediates.length === 0 && <div className="text-center py-8 text-warm-gray">{showAll ? 'No intermediate requirements.' : '🎉 All intermediates ready!'}</div>}
+                  </div>
+                )}
+              </>
+            )}
+          </main>
+          <Modal isOpen={modal.type === 'buy'} onClose={() => setModal({ type: null })} title="Record Purchase">
+            {modal.data && <BuyDialog ingredient={modal.data} suggestedQty={modal.data.suggestedQty} onConfirm={(qty) => { onBuyIngredient(modal.data.id, qty); setModal({ type: null }); toast(`Purchased ${qty} ${modal.data.unit}`, 'success'); }} onCancel={() => setModal({ type: null })} />}
+          </Modal>
+          <Modal isOpen={modal.type === 'prepare'} onClose={() => setModal({ type: null })} title="Prepare Intermediate">
+            {modal.data && <PrepareDialog intermediate={modal.data} ingredients={ingredients} onConfirm={(units) => { onPrepareIntermediate(modal.data.id, units); setModal({ type: null }); toast(`Prepared ${units} ${modal.data.unit}`, 'success'); }} onCancel={() => setModal({ type: null })} />}
+          </Modal>
+        </div>
+      );
+    };
+
+    // ============== MAIN APP ==============
+    const AppInner = () => {
+      const [page, setPage] = useState('ingredients');
+      const [ingredients, setIngredients] = useState([]);
+      const [intermediates, setIntermediates] = useState([]);
+      const [dishes, setDishes] = useState([]);
+      const [loading, setLoading] = useState(true);
+      const toast = useToast();
+
+      useEffect(() => {
+        const loadData = async () => {
+          const ings = await db.ingredients.toArray();
+          const ints = await db.intermediates.toArray();
+          const dsh = await db.dishes.toArray();
+          setIngredients(ings);
+          setIntermediates(ints);
+          setDishes(dsh);
+          setLoading(false);
+        };
+        loadData();
+      }, []);
+
+      // Enrich
+      const enrichedIngredients = useMemo(() => ingredients.map(enrichWithSpoilage), [ingredients]);
+      const enrichedDishes = useMemo(() => dishes.map(d => enrichWithAvailability(d, ingredients, intermediates)), [dishes, ingredients, intermediates]);
+      const shoppingData = useMemo(() => computeQuantityAggregation(dishes, ingredients, intermediates), [dishes, ingredients, intermediates]);
+
+      // === INGREDIENT ACTIONS ===
+      const addIngredient = async (data) => {
+        const ingredient = { id: generateId(), ...data, purchasedAt: null };
+        await db.ingredients.add(ingredient);
+        setIngredients(prev => [...prev, ingredient]);
+      };
+
+      const editIngredient = async (id, data) => {
+        await db.ingredients.update(id, data);
+        setIngredients(prev => prev.map(i => i.id === id ? { ...i, ...data } : i));
+      };
+
+      const deleteIngredient = async (id) => {
+        await db.ingredients.delete(id);
+        setIngredients(prev => prev.filter(i => i.id !== id));
+      };
+
+      const buyIngredient = async (id, qty) => {
+        if (qty <= 0) { toast('Invalid quantity', 'error'); return; }
+        const ing = ingredients.find(i => i.id === id);
+        if (!ing) { toast('Ingredient not found', 'error'); return; }
+        const updates = { stockQty: ing.stockQty + qty, purchasedAt: new Date().toISOString() };
+        await db.ingredients.update(id, updates);
+        setIngredients(prev => prev.map(i => i.id === id ? { ...i, ...updates } : i));
+      };
+
+      // === INTERMEDIATE ACTIONS ===
+      const addIntermediate = async (data) => {
+        const intermediate = { id: generateId(), ...data };
+        await db.intermediates.add(intermediate);
+        setIntermediates(prev => [...prev, intermediate]);
+      };
+
+      const editIntermediate = async (id, data) => {
+        await db.intermediates.update(id, data);
+        setIntermediates(prev => prev.map(i => i.id === id ? { ...i, ...data } : i));
+      };
+
+      const deleteIntermediate = async (id) => {
+        await db.intermediates.delete(id);
+        setIntermediates(prev => prev.filter(i => i.id !== id));
+      };
+
+      const prepareIntermediate = async (id, unitsToPrepare) => {
+        if (unitsToPrepare <= 0) { toast('Invalid quantity', 'error'); return; }
+        const inter = intermediates.find(i => i.id === id);
+        if (!inter) { toast('Intermediate not found', 'error'); return; }
+        if (!inter.inputIngredients || inter.inputIngredients.length === 0) { toast('No input ingredients defined', 'error'); return; }
+
+        // Validate all inputs sufficient
+        const ingredientMap = new Map(ingredients.map(i => [i.id, i]));
+        for (const input of inter.inputIngredients) {
+          const ing = ingredientMap.get(input.ingredientId);
+          if (!ing) { toast(`Ingredient not found for ${input.ingredientId}`, 'error'); return; }
+          const needed = unitsToPrepare * input.qtyPerUnit;
+          if (ing.stockQty < needed) {
+            toast(`Not enough ${ing.name}: need ${needed}, have ${ing.stockQty}`, 'error');
+            return;
+          }
+        }
+
+        // Use Dexie transaction for atomicity
+        try {
+          await db.transaction('rw', db.ingredients, db.intermediates, async () => {
+            for (const input of inter.inputIngredients) {
+              const ing = ingredientMap.get(input.ingredientId);
+              const deduction = unitsToPrepare * input.qtyPerUnit;
+              const newStock = Math.max(0, ing.stockQty - deduction);
+              await db.ingredients.update(input.ingredientId, { stockQty: newStock });
+            }
+            await db.intermediates.update(id, { stockQty: inter.stockQty + unitsToPrepare });
+          });
+
+          // Update state
+          const updatedIngs = ingredients.map(i => {
+            const input = inter.inputIngredients.find(inp => inp.ingredientId === i.id);
+            if (input) return { ...i, stockQty: Math.max(0, i.stockQty - unitsToPrepare * input.qtyPerUnit) };
+            return i;
+          });
+          setIngredients(updatedIngs);
+          setIntermediates(prev => prev.map(i => i.id === id ? { ...i, stockQty: i.stockQty + unitsToPrepare } : i));
+        } catch (err) {
+          toast('Preparation failed — rolled back', 'error');
+          console.error(err);
+        }
+      };
+
+      // === DISH ACTIONS ===
+      const addDish = async (data) => {
+        const dish = { id: generateId(), ...data, status: 'Planned' };
+        await db.dishes.add(dish);
+        setDishes(prev => [...prev, dish]);
+      };
+
+      const editDish = async (id, data) => {
+        await db.dishes.update(id, data);
+        setDishes(prev => prev.map(d => d.id === id ? { ...d, ...data } : d));
+      };
+
+      const deleteDish = async (id) => {
+        await db.dishes.delete(id);
+        setDishes(prev => prev.filter(d => d.id !== id));
+      };
+
+      const cookDish = async (id) => {
+        const dish = dishes.find(d => d.id === id);
+        if (!dish) { toast('Dish not found', 'error'); return; }
+
+        // Guard: already cooked
+        if (dish.status === 'Cooked') { toast('Dish is already cooked', 'warning'); return; }
+
+        // Guard: availability check
+        const avail = computeAvailability(dish, ingredients, intermediates);
+        if (!avail.canCook) {
+          toast('Cannot cook — missing items', 'error');
+          return;
+        }
+
+        try {
+          await db.transaction('rw', db.ingredients, db.intermediates, db.dishes, async () => {
+            // Deduct ingredients
+            for (const entry of (dish.recipeIngredients || [])) {
+              const ing = ingredients.find(i => i.id === entry.ingredientId);
+              if (!ing) throw new Error(`Ingredient ${entry.ingredientId} not found`);
+              const newStock = ing.stockQty - entry.qty;
+              if (newStock < 0) throw new Error(`Would cause negative stock for ${ing.name}`);
+              await db.ingredients.update(entry.ingredientId, { stockQty: newStock });
+            }
+            // Deduct intermediates
+            for (const entry of (dish.recipeIntermediates || [])) {
+              const inter = intermediates.find(i => i.id === entry.intermediateId);
+              if (!inter) throw new Error(`Intermediate ${entry.intermediateId} not found`);
+              const newStock = inter.stockQty - entry.qty;
+              if (newStock < 0) throw new Error(`Would cause negative stock for ${inter.name}`);
+              await db.intermediates.update(entry.intermediateId, { stockQty: newStock });
+            }
+            await db.dishes.update(id, { status: 'Cooked' });
+          });
+
+          // Update state after successful transaction
+          setIngredients(prev => {
+            const updated = [...prev];
+            for (const entry of (dish.recipeIngredients || [])) {
+              const idx = updated.findIndex(i => i.id === entry.ingredientId);
+              if (idx !== -1) updated[idx] = { ...updated[idx], stockQty: Math.max(0, updated[idx].stockQty - entry.qty) };
+            }
+            return updated;
+          });
+          setIntermediates(prev => {
+            const updated = [...prev];
+            for (const entry of (dish.recipeIntermediates || [])) {
+              const idx = updated.findIndex(i => i.id === entry.intermediateId);
+              if (idx !== -1) updated[idx] = { ...updated[idx], stockQty: Math.max(0, updated[idx].stockQty - entry.qty) };
+            }
+            return updated;
+          });
+          setDishes(prev => prev.map(d => d.id === id ? { ...d, status: 'Cooked' } : d));
+        } catch (err) {
+          toast(`Cook failed: ${err.message}`, 'error');
+          console.error(err);
+        }
+      };
+
+      if (loading) {
+        return <div className="min-h-screen bg-cream flex items-center justify-center"><div className="w-8 h-8 border-2 border-terracotta border-t-transparent rounded-full animate-spin"></div></div>;
+      }
+
+      return (
+        <div>
+          {page === 'ingredients' && <IngredientsPage ingredients={enrichedIngredients} onAdd={addIngredient} onEdit={editIngredient} onDelete={deleteIngredient} onBuy={buyIngredient} />}
+          {page === 'intermediates' && <IntermediatesPage intermediates={intermediates} ingredients={enrichedIngredients} onAdd={addIntermediate} onEdit={editIntermediate} onDelete={deleteIntermediate} onPrepare={prepareIntermediate} />}
+          {page === 'dishes' && <DishesPage dishes={enrichedDishes} ingredients={enrichedIngredients} intermediates={intermediates} onAdd={addDish} onEdit={editDish} onDelete={deleteDish} onCook={cookDish} />}
+          {page === 'shopping' && <ShoppingListPage shoppingData={shoppingData} ingredients={enrichedIngredients} intermediates={intermediates} onBuyIngredient={buyIngredient} onPrepareIntermediate={prepareIntermediate} />}
+
+          {/* Bottom Navigation */}
+          <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-light-gray/30 z-20">
+            <div className="max-w-4xl mx-auto flex justify-around">
+              <button onClick={() => setPage('ingredients')} className={`flex flex-col items-center gap-1 py-3 px-3 ${page === 'ingredients' ? 'text-terracotta' : 'text-warm-gray'}`}>
+                <Icons.Package /><span className="text-xs font-medium">Ingredients</span>
+              </button>
+              <button onClick={() => setPage('intermediates')} className={`flex flex-col items-center gap-1 py-3 px-3 ${page === 'intermediates' ? 'text-plum' : 'text-warm-gray'}`}>
+                <Icons.Beaker /><span className="text-xs font-medium">Preps</span>
+              </button>
+              <button onClick={() => setPage('dishes')} className={`flex flex-col items-center gap-1 py-3 px-3 ${page === 'dishes' ? 'text-terracotta' : 'text-warm-gray'}`}>
+                <Icons.UtensilsCrossed /><span className="text-xs font-medium">Dishes</span>
+              </button>
+              <button onClick={() => setPage('shopping')} className={`flex flex-col items-center gap-1 py-3 px-3 relative ${page === 'shopping' ? 'text-terracotta' : 'text-warm-gray'}`}>
+                <Icons.ShoppingCart /><span className="text-xs font-medium">Shop</span>
+                {(shoppingData.ingredientsToBuy + shoppingData.intermediatesToPrepare) > 0 && (
+                  <span className="absolute top-1.5 right-1 w-5 h-5 bg-tomato text-white text-xs rounded-full flex items-center justify-center font-medium">
+                    {shoppingData.ingredientsToBuy + shoppingData.intermediatesToPrepare}
+                  </span>
+                )}
+              </button>
+            </div>
+          </nav>
+        </div>
+      );
+    };
+
+    const App = () => <ToastProvider><AppInner /></ToastProvider>;
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
